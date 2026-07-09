@@ -76,11 +76,24 @@ Run elevated. If you double-click or run non-elevated, it prints the elevated co
 
 | Mode | Effect |
 |---|---|
-| `-Verify` | Read-only. Service states, endpoint reachability, firewall rules, policy. PASS/FAIL per check. |
+| `-Verify` | Read-only. Services, hosts block, `EnableCdp`, firewall rules, endpoint reachability, persistence task. PASS/FAIL per check. Exit 0 all-pass, 1 any-fail. |
 | `-Test` | Reversible proof: sinkholes the two live endpoints + adds one firewall rule, measures before/after, **auto-rolls back**. Never touches services. |
-| `-Apply` | Applies all four layers. Records original service start-types to `%ProgramData%\SuppressGDID\state.json` for exact undo. |
-| `-Undo` | Restores services from the state file, removes the hosts block, deletes the firewall rules, restores the policy key. |
+| `-Apply` | Applies all four layers **and registers a SYSTEM re-apply task** (below). Records original service start-types to `state.json` for exact undo (first-write-wins — safe to re-run). |
+| `-Undo` | Restores services from the state file, removes the hosts block + firewall rules, restores the policy key, and unregisters the task. |
 | `-Apply -IncludeLoginLive` | Also sinkholes `login.live.com`. **Breaks Microsoft Store / MSA sign-in.** Opt-in. |
+| `-Apply -NoPersist` | Apply without the scheduled task (also what the task itself runs, to avoid recursion). |
+
+### Durability, logging, exit codes
+
+- **Persistence:** `-Apply` installs a copy to `%ProgramData%\SuppressGDID\` and registers a SYSTEM scheduled task **`GDIDie-Enforce`** that re-applies at startup — so a Windows feature update that re-enables `CDPSvc` gets re-blocked. `-Undo` removes it.
+- **Audit log:** every `-Apply`/`-Undo` writes a timestamped transcript to `%ProgramData%\SuppressGDID\logs\`.
+- **Automation:** `-Verify` returns exit `0` (all pass) or `1` (any fail); `Assert-Admin` exits `2`. Gate CI/Intune/SCCM on these. (Run `-Verify` elevated to include the SYSTEM task check; non-elevated it is skipped, not failed.)
+- **State safety:** `state.json` is merged first-write-wins, so re-running `-Apply` never overwrites the true pre-mitigation values (regression fixed in v1.1.0).
+
+### Tests & signing
+
+- **Tests:** `powershell -ExecutionPolicy Bypass -File .\Tests\Run-Tests.ps1` — dependency-free unit tests for the hosts-block and state-guard logic. No admin, no network. Exit 0/1.
+- **Signing:** the repo ships unsigned; sign at deploy time with **your** Authenticode / org PKI cert (`Set-AuthenticodeSignature`) so it runs under `AllSigned`. Enterprise trust can't be shipped in source.
 
 Find your own GDID (read-only, no admin), redact before sharing:
 
