@@ -71,6 +71,32 @@ Assert ((($res -join "`n")) -eq ($broken -join "`n")) 'begin-without-end leaves 
 $balanced = @('127.0.0.1 localhost', $Sentinel0, '0.0.0.0 x', $Sentinel1, 'keep.me')
 Assert (((Remove-ManagedBlock $balanced) -join "`n") -eq "127.0.0.1 localhost`nkeep.me") 'balanced block still strips correctly'
 
+Write-Host "sentinel corruption detection (F4)" -ForegroundColor Cyan
+$B=$Sentinel0; $E=$Sentinel1
+Assert (-not (Test-ManagedBlockCorrupt @('a',$B,'0.0.0.0 x',$E,'b'))) 'clean single balanced block: not corrupt'
+Assert (-not (Test-ManagedBlockCorrupt @('a','b')))                   'no block: not corrupt'
+Assert (Test-ManagedBlockCorrupt @('a',$B,'x'))                       'begin-without-end: corrupt'
+Assert (Test-ManagedBlockCorrupt @('a',$E,'x'))                       'end-without-begin: corrupt'
+Assert (Test-ManagedBlockCorrupt @($B,'x',$E,$B,'y',$E))             'two/duplicate blocks: corrupt'
+Assert (Test-ManagedBlockCorrupt @($B,$B,'x',$E))                     'nested begin: corrupt'
+Assert (Test-ManagedBlockCorrupt @($B,'x',$E,$E))                     'duplicate end: corrupt'
+$threw=$false; try { Add-ManagedBlock @('a',$B,'x') @('z.com') | Out-Null } catch { $threw=$true }
+Assert $threw 'Add-ManagedBlock throws on a corrupt existing block (never appends onto corruption)'
+Assert (((Remove-ManagedBlock @('a',$B,'x')) -join "`n") -eq (@('a',$B,'x') -join "`n")) 'Remove leaves a corrupt file unchanged'
+
+Write-Host "SID-based identity check (F1)" -ForegroundColor Cyan
+Assert (Test-IdentityUntrusted (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545'))) 'Users SID = untrusted'
+Assert (Test-IdentityUntrusted (New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')))      'Everyone SID = untrusted'
+Assert (-not (Test-IdentityUntrusted (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')))) 'SYSTEM SID = trusted'
+
+Write-Host "policy restore plan (F7)" -ForegroundColor Cyan
+$pp = Get-PolicyRestorePlan @{ EnableCdp='ABSENT'; UploadUserActivities=0; PublishUserActivities=1 }
+Assert ($pp['EnableCdp'].Action -eq 'remove')                                      'ABSENT -> remove'
+Assert ($pp['UploadUserActivities'].Action -eq 'set' -and $pp['UploadUserActivities'].Value -eq 0) 'present-0 -> set 0'
+Assert ($pp['PublishUserActivities'].Action -eq 'set' -and $pp['PublishUserActivities'].Value -eq 1) 'present-1 -> set 1'
+Assert ((Get-PolicyRestorePlan @{ EnableCdp='2' })['EnableCdp'].Value -eq 2)       'legacy string value coerced to int'
+Assert ((Get-PolicyRestorePlan $null).Count -eq 0)                                 'null policyPrev -> empty plan'
+
 Write-Host ""
 Write-Host ("RESULT: {0} passed, {1} failed" -f $script:Pass,$script:Fail) -ForegroundColor $(if($script:Fail){'Red'}else{'Green'})
 exit ([int]($script:Fail -gt 0))

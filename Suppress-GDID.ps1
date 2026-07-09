@@ -1,6 +1,6 @@
 <#
     Suppress-GDID.ps1  --  Kill the Windows GDID / device-graph telemetry vector.
-    Version 1.3.0
+    Version 1.4.0
 
     The GDID is a server-assigned MSA Device PUID (0018-class). Chain:
         wlidsvc  --provisions-->  login.live.com  --returns PUID-->  registry
@@ -36,7 +36,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Version    = '1.3.0'
+$Version    = '1.4.0'
 $HostsPath  = "$env:SystemRoot\System32\drivers\etc\hosts"
 $InstallDir = "$env:ProgramData\SuppressGDID"
 $StateFile  = "$InstallDir\state.json"
@@ -72,8 +72,20 @@ $LoginHosts   = @('login.live.com')
 $KillServices = 'CDPSvc','DoSvc','DiagTrack','dmwappushservice'
 
 # --- pure, dot-source-testable helpers -------------------------------------
+function Test-ManagedBlockCorrupt([string[]]$lines) {
+    # true if the managed sentinels are malformed: begin-without-end, end-without-begin,
+    # nested begin, or more than one block. A clean file has 0 or 1 balanced block. Pure.
+    $depth = 0; $begins = 0
+    foreach ($l in $lines) {
+        if ($l -eq $Sentinel0)     { if ($depth -ne 0) { return $true }; $depth++; $begins++ }
+        elseif ($l -eq $Sentinel1) { if ($depth -eq 0) { return $true }; $depth-- }
+    }
+    ($depth -ne 0) -or ($begins -gt 1)
+}
 function Remove-ManagedBlock([string[]]$lines) {
-    # strip everything between the sentinels (inclusive). Pure: returns lines.
+    # strip the one balanced managed block. Pure. On corruption return input UNCHANGED - never
+    # silently delete the tail or rewrite an ambiguous file.
+    if (Test-ManagedBlockCorrupt $lines) { return ,$lines }
     $out = New-Object System.Collections.Generic.List[string]
     $inside = $false
     foreach ($l in $lines) {
@@ -81,13 +93,11 @@ function Remove-ManagedBlock([string[]]$lines) {
         if ($l -eq $Sentinel1) { $inside = $false; continue }
         if (-not $inside) { $out.Add($l) }
     }
-    # L-1: begin-sentinel without a matching end = corrupt/unbalanced. Do NOT drop the tail;
-    # leave the file untouched rather than silently deleting everything after the begin marker.
-    if ($inside) { return ,$lines }
     ,$out.ToArray()
 }
 function Add-ManagedBlock([string[]]$lines,[string[]]$names) {
-    # append a fresh managed block for $names. Pure: returns lines.
+    # replace the managed block with a fresh one. Pure. REFUSE to append onto a corrupt block.
+    if (Test-ManagedBlockCorrupt $lines) { throw "SECURITY: hosts managed block is corrupt (unbalanced/duplicate/nested sentinels) - refusing to rewrite." }
     $out = New-Object System.Collections.Generic.List[string]
     (Remove-ManagedBlock $lines) | ForEach-Object { $out.Add($_) }
     if ($names.Count) {
@@ -137,14 +147,21 @@ function Test-PathIsReparse([string]$path) {
     $i = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
     [bool]($i -and ($i.Attributes -band [IO.FileAttributes]::ReparsePoint))
 }
+$script:UntrustedSids = @('S-1-5-32-545','S-1-1-0','S-1-5-11')  # Users, Everyone, Authenticated Users
+function Test-IdentityUntrusted($identityRef) {
+    # SID-based, not name-based: robust on non-English Windows where account names are localized.
+    $sid = try { $identityRef.Translate([System.Security.Principal.SecurityIdentifier]).Value }
+           catch { if ($identityRef.Value -match '^S-\d') { $identityRef.Value } else { $null } }
+    $sid -in $script:UntrustedSids
+}
 function Test-PathUserWritable([string]$path) {
-    # true if any Allow ACE grants Users/Everyone/Authenticated Users a write-class right.
+    # true if any Allow ACE grants an untrusted SID a write-class right.
     # Mask is write-only bits (no read bits) so Users:ReadAndExecute never false-positives.
     $wmask = [System.Security.AccessControl.FileSystemRights]'Write,Delete,ChangePermissions,TakeOwnership'
     [bool]((Get-Acl -LiteralPath $path).Access | Where-Object {
         $_.AccessControlType -eq 'Allow' -and
-        $_.IdentityReference.Value -match '\\Users$|Everyone|Authenticated Users' -and
-        ($_.FileSystemRights -band $wmask) })
+        ($_.FileSystemRights -band $wmask) -and
+        (Test-IdentityUntrusted $_.IdentityReference) })
 }
 function Protect-InstallDir {
     # Fail-closed: reject reparse points, create+lock the dir, abort if it stays user-writable.
@@ -168,6 +185,7 @@ function Protect-InstalledScript {
     if (Test-PathUserWritable $InstalledScript) { throw "SECURITY: installed script is user-writable - refusing to register SYSTEM task." }
 }
 function Start-AuditLog([string]$mode) {
+    if ((Test-Path -LiteralPath $LogDir) -and (Test-PathIsReparse $LogDir)) { throw "SECURITY: $LogDir is a reparse point/junction - aborting." }
     Initialize-Dir $LogDir
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $log = "$LogDir\gdid-$mode-$stamp.log"
@@ -183,6 +201,7 @@ function Set-HostsBlock([string[]]$names) {
 }
 function Remove-HostsBlock {
     $lines = if (Test-Path $HostsPath) { Get-Content $HostsPath } else { @() }
+    if (Test-ManagedBlockCorrupt $lines) { Write-Warning "hosts managed block is corrupt - leaving the hosts file untouched (fix it manually)."; return }
     $new = Remove-ManagedBlock $lines
     [System.IO.File]::WriteAllLines($HostsPath, $new, (New-Object System.Text.UTF8Encoding($false)))
     Clear-DnsClientCache
@@ -209,14 +228,36 @@ function Set-SvcStartMode([string]$name,[string]$mode) {
     if (Test-Path $key) { Set-ItemProperty $key -Name Start -Value $map[$mode] -Type DWord }
 }
 
+function Read-StateFileSafely {
+    # F2: never trust a reparse-point or user-writable state file (attacker could steer -Undo).
+    if (-not (Test-Path -LiteralPath $StateFile)) { return $null }
+    if (Test-PathIsReparse $StateFile)    { throw "SECURITY: $StateFile is a reparse point - aborting." }
+    if (Test-PathUserWritable $StateFile) { throw "SECURITY: $StateFile is writable by standard users - refusing to trust it." }
+    try { Get-Content -LiteralPath $StateFile -Raw | ConvertFrom-Json } catch { $null }
+}
+function Write-StateFileSafely($obj) {
+    if ((Test-Path -LiteralPath $StateFile) -and (Test-PathIsReparse $StateFile)) { throw "SECURITY: $StateFile is a reparse point - aborting." }
+    ($obj | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $StateFile -Encoding ASCII
+    if (Test-PathUserWritable $StateFile) { throw "SECURITY: $StateFile is user-writable after write - aborting." }
+}
+function Get-PolicyRestorePlan($policyPrev) {
+    # F7 pure: saved policyPrev (hashtable/PSObject) -> @{ Name = @{Action='remove'|'set'; Value=int} }
+    $plan = @{}
+    if (-not $policyPrev) { return $plan }
+    $names = if ($policyPrev -is [hashtable]) { $policyPrev.Keys } else { $policyPrev.psobject.Properties.Name }
+    foreach ($n in $names) {
+        $v = if ($policyPrev -is [hashtable]) { $policyPrev[$n] } else { $policyPrev.$n }
+        if ("$v" -eq 'ABSENT') { $plan[$n] = @{ Action = 'remove' } }
+        else                   { $plan[$n] = @{ Action = 'set'; Value = [int]$v } }
+    }
+    $plan
+}
 function Save-State {
     Protect-InstallDir
     # Load existing so a re-Apply NEVER clobbers the true pre-mitigation originals.
     $saved = @{}
-    if (Test-Path $StateFile) {
-        try { (Get-Content $StateFile -Raw | ConvertFrom-Json).psobject.Properties |
-              ForEach-Object { $saved[$_.Name] = $_.Value } } catch { Write-Verbose $_.Exception.Message }
-    }
+    $existing = Read-StateFileSafely
+    if ($existing) { $existing.psobject.Properties | ForEach-Object { $saved[$_.Name] = $_.Value } }
     $svc = @{}
     if ($saved.ContainsKey('services') -and $saved.services) {
         $saved.services.psobject.Properties | ForEach-Object { $svc[$_.Name] = $_.Value }
@@ -241,7 +282,7 @@ function Save-State {
     }
     $saved['services'] = $svc
     $saved['version']  = $Version
-    ($saved | ConvertTo-Json -Depth 5) | Set-Content $StateFile -Encoding ASCII
+    Write-StateFileSafely $saved
 }
 
 function Get-PersistenceArgument([bool]$includeLogin) {
@@ -251,9 +292,19 @@ function Get-PersistenceArgument([bool]$includeLogin) {
     if ($includeLogin) { $a += ' -IncludeLoginLive' }
     $a
 }
+function Assert-InstallSafe {
+    # F6: the SYSTEM task must NEVER be registered if any object it depends on is a reparse point
+    # or writable by standard users. Checked immediately before Register-ScheduledTask.
+    foreach ($p in @($InstallDir, $InstalledScript, $StateFile, $LogDir)) {
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        if (Test-PathIsReparse $p)    { throw "SECURITY: $p is a reparse point - refusing to register SYSTEM task." }
+        if (Test-PathUserWritable $p) { throw "SECURITY: $p is user-writable - refusing to register SYSTEM task." }
+    }
+}
 function Install-Persistence {
     Protect-InstallDir
     Protect-InstalledScript          # H-1/H-2: reparse-safe, fail-closed; aborts if file stays user-writable
+    Assert-InstallSafe               # F6: gate on dir + script + state.json + logs before registering
     $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (Get-PersistenceArgument $IncludeLoginLive)
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $princ   = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest -LogonType ServiceAccount
@@ -312,7 +363,7 @@ function Invoke-Undo {
     Assert-Admin
     $log = Start-AuditLog 'undo'
     try {
-        $st = if (Test-Path $StateFile) { Get-Content $StateFile -Raw | ConvertFrom-Json } else { $null }
+        $st = Read-StateFileSafely
         Write-Host "[E] Removing persistence task" -ForegroundColor Cyan; Remove-Persistence
         Write-Host "[A] Restoring services" -ForegroundColor Cyan
         $defaults = @{ CDPSvc='Automatic'; DoSvc='Manual'; DiagTrack='Automatic'; dmwappushservice='Manual' }
@@ -327,13 +378,13 @@ function Invoke-Undo {
         Write-Host "[C] Removing firewall rules" -ForegroundColor Cyan; Remove-FwBlock
         Write-Host "[D] Restoring policy values" -ForegroundColor Cyan
         $sysKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
-        $pol = @{}
-        if ($st -and $st.policyPrev) { $st.policyPrev.psobject.Properties | ForEach-Object { $pol[$_.Name] = $_.Value } }
-        elseif ($st -and $null -ne $st.enableCdpPrev) { $pol['EnableCdp'] = $st.enableCdpPrev }   # old state.json
-        foreach ($n in 'EnableCdp','UploadUserActivities','PublishUserActivities','EnableActivityFeed') {
-            if (-not $pol.ContainsKey($n)) { continue }                                            # unknown original: leave as-is
-            if ("$($pol[$n])" -eq 'ABSENT') { Remove-ItemProperty $sysKey -Name $n -ErrorAction SilentlyContinue; Write-Host "    $n -> removed" }
-            else { Set-ItemProperty $sysKey -Name $n -Value ([int]$pol[$n]) -Type DWord; Write-Host "    $n -> $($pol[$n])" }
+        $polPrev = if ($st -and $st.policyPrev) { $st.policyPrev }
+                   elseif ($st -and $null -ne $st.enableCdpPrev) { @{ EnableCdp = $st.enableCdpPrev } }   # legacy state.json
+                   else { $null }
+        $plan = Get-PolicyRestorePlan $polPrev
+        foreach ($n in $plan.Keys) {
+            if ($plan[$n].Action -eq 'remove') { Remove-ItemProperty $sysKey -Name $n -ErrorAction SilentlyContinue; Write-Host "    $n -> removed" }
+            else { Set-ItemProperty $sysKey -Name $n -Value $plan[$n].Value -Type DWord; Write-Host "    $n -> $($plan[$n].Value)" }
         }
         Write-Host "`nREVERTED. Reboot to fully restart CDP/DO. Log: $log" -ForegroundColor Green
     } finally { try { Stop-Transcript | Out-Null } catch { Write-Verbose $_.Exception.Message } }
@@ -383,9 +434,9 @@ function Invoke-Test {
     Write-Host "`n-- BEFORE --" -ForegroundColor Yellow
     ($proof | ForEach-Object { Test-Endpoint $_ }) | Format-Table -AutoSize | Out-String | Write-Host
     $blocked = 0; $svcFilter = '(none)'
-    # M-2: snapshot the EXACT hosts file so rollback restores a pre-existing applied block
-    # instead of deleting it. Byte-accurate restore, not "remove our block".
-    $hostsSnapshot = if (Test-Path $HostsPath) { [System.IO.File]::ReadAllText($HostsPath) } else { $null }
+    # M-2/F5: snapshot the EXACT bytes of the hosts file so rollback is byte-for-byte
+    # (preserves BOM, encoding, newline style, unrelated content). $null = file did not exist.
+    $hostsSnapshot = if (Test-Path -LiteralPath $HostsPath) { [System.IO.File]::ReadAllBytes($HostsPath) } else { $null }
     try {
         Write-Host "-- APPLYING sinkhole + one firewall rule (CDPSvc) --" -ForegroundColor Yellow
         Set-HostsBlock $proof
@@ -400,8 +451,8 @@ function Invoke-Test {
         Write-Host ("`nVERDICT: {0}/{1} endpoints reachable->blocked; firewall rule scoped to '{2}'." -f $blocked,$after.Count,$svcFilter) -ForegroundColor Green
     } finally {
         Write-Host "`n-- ROLLING BACK (always runs) --" -ForegroundColor Yellow
-        if ($null -ne $hostsSnapshot) { [System.IO.File]::WriteAllText($HostsPath, $hostsSnapshot, (New-Object System.Text.UTF8Encoding($false))) }
-        else { Remove-HostsBlock }
+        if ($null -ne $hostsSnapshot) { [System.IO.File]::WriteAllBytes($HostsPath, $hostsSnapshot) }
+        elseif (Test-Path -LiteralPath $HostsPath) { Remove-Item -LiteralPath $HostsPath -Force }   # F5: file did not exist pre-test
         Get-NetFirewallRule -DisplayName "$FwPrefix TESTPROBE*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
         Clear-DnsClientCache
         ($proof | ForEach-Object { Test-Endpoint $_ }) | Format-Table -AutoSize | Out-String | Write-Host

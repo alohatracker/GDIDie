@@ -48,6 +48,19 @@ try {
     if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+Write-Host "byte-exact hosts rollback (F5)" -ForegroundColor Cyan
+$hf = Join-Path ([IO.Path]::GetTempPath()) ("gdidie-hosts-" + [Guid]::NewGuid().ToString('N').Substring(0,8))
+try {
+    # original: UTF-8 BOM + CRLF + a trailing line with no EOL
+    $orig = [byte[]]@(0xEF,0xBB,0xBF) + [Text.Encoding]::UTF8.GetBytes("127.0.0.1 localhost`r`n# keep`r`nno-eol-tail")
+    [IO.File]::WriteAllBytes($hf, $orig)
+    $snap = [IO.File]::ReadAllBytes($hf)                                    # -Test snapshot
+    [IO.File]::WriteAllLines($hf, @('0.0.0.0 proof','# junk'), (New-Object Text.UTF8Encoding($false)))  # -Test mutation (re-encodes)
+    [IO.File]::WriteAllBytes($hf, $snap)                                    # -Test rollback
+    $now = [IO.File]::ReadAllBytes($hf)
+    Assert (($now.Length -eq $orig.Length) -and (-not (Compare-Object $now $orig))) 'byte-for-byte restore preserves BOM/CRLF/tail'
+} finally { Remove-Item $hf -Force -ErrorAction SilentlyContinue }
+
 Write-Host ""
 Write-Host ("SMOKE: {0} passed, {1} failed" -f $pass,$fail) -ForegroundColor $(if($fail){'Red'}else{'Green'})
 exit ([int]($fail -gt 0))
