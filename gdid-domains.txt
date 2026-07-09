@@ -1,0 +1,31 @@
+# GDID / Windows device-graph blocklist
+# Plain domain list. Works as-is for Pi-hole (exact deny), AdGuard, hosts files, or any DNS sink.
+# Source chain: wlidsvc -> login.live.com (mint) -> CDPSvc -> DDS graph -> Delivery Optimization / activity uploads.
+
+# --- Device Directory Service (DDS) registration: where the GDID gets keyed to your device ---
+dds.microsoft.com
+fd.dds.microsoft.com
+aad.cs.dds.microsoft.com
+cs.dds.microsoft.com
+cdpcs.access.microsoft.com
+
+# --- Delivery Optimization DSP: where GDID surfaces as UCDOStatus.GlobalDeviceId ---
+geo.prod.do.dsp.mp.microsoft.com
+
+# --- Activity uploads that carry the device id ---
+activity.windows.com
+
+# --- Classic diagnostics/telemetry (belt-and-suspenders; your Pi-hole may already cover *.events.data) ---
+v10.events.data.microsoft.com
+v20.events.data.microsoft.com
+self.events.data.microsoft.com
+settings-win.data.microsoft.com
+watson.telemetry.microsoft.com
+vortex.data.microsoft.com
+vortex-win.data.microsoft.com
+telecommand.telemetry.microsoft.com
+
+# --- OPTIONAL / AGGRESSIVE: the MSA mint endpoint. ---
+# Blocking this stops device (re)provisioning but BREAKS Microsoft Store sign-in and MSA login.
+# You have NO Microsoft Account, so the only real casualty for you is the Store. Uncomment to use:
+# login.live.com
