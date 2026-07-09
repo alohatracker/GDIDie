@@ -81,7 +81,7 @@ Run elevated. If you double-click or run non-elevated, it prints the elevated co
 | `-Test` | Reversible proof: sinkholes the two live endpoints + adds one firewall rule, measures before/after, **auto-rolls back**. Never touches services. |
 | `-Apply` | Applies all four layers **and registers a SYSTEM re-apply task** (below). Records original service start-types to `state.json` for exact undo (first-write-wins — safe to re-run). |
 | `-Undo` | Restores services from the state file, removes the hosts block + firewall rules, restores the policy key, and unregisters the task. |
-| `-Apply -IncludeLoginLive` | Also sinkholes `login.live.com`. **Breaks Microsoft Store / MSA sign-in.** Opt-in. |
+| `-Apply -IncludeLoginLive` | Also sinkholes `login.live.com`. **Breaks Microsoft Store / MSA sign-in.** Opt-in — and the boot-time enforce task remembers the choice, so it stays blocked across reboots. Use this if you don't have a Microsoft Account. |
 | `-Apply -NoPersist` | Apply without the scheduled task (also what the task itself runs, to avoid recursion). |
 
 ### Durability, logging, exit codes

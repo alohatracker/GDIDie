@@ -59,6 +59,11 @@ $adm = $ar | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-32-544' }
 Assert ($adm.FileSystemRights -eq 'FullControl') 'Administrators = FullControl'
 Assert (($ar | Where-Object { $_.IdentityReference.Value -eq 'S-1-1-0' }).Count -eq 0) 'no Everyone ACE'
 
+Write-Host "persistence carries the login.live.com choice" -ForegroundColor Cyan
+Assert ((Get-PersistenceArgument $false) -match '-Apply -NoPersist') 'boot task always re-applies -Apply -NoPersist'
+Assert ((Get-PersistenceArgument $false) -notmatch 'IncludeLoginLive') 'default: boot task does NOT block login.live.com'
+Assert ((Get-PersistenceArgument $true) -match '-IncludeLoginLive') 'opt-in: boot task carries -IncludeLoginLive so the block persists'
+
 Write-Host ""
 Write-Host ("RESULT: {0} passed, {1} failed" -f $script:Pass,$script:Fail) -ForegroundColor $(if($script:Fail){'Red'}else{'Green'})
 exit ([int]($script:Fail -gt 0))

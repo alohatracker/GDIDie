@@ -203,11 +203,17 @@ function Save-State {
     ($saved | ConvertTo-Json -Depth 5) | Set-Content $StateFile -Encoding ASCII
 }
 
+function Get-PersistenceArgument([bool]$includeLogin) {
+    # Args the boot task re-applies with. MUST carry -IncludeLoginLive when the user chose it,
+    # otherwise the enforcer silently unblocks login.live.com on next reboot. Pure/testable.
+    $a = "-NoProfile -ExecutionPolicy Bypass -File `"$InstalledScript`" -Apply -NoPersist"
+    if ($includeLogin) { $a += ' -IncludeLoginLive' }
+    $a
+}
 function Install-Persistence {
     Protect-InstallDir
     Copy-Item $PSCommandPath $InstalledScript -Force
-    $action  = New-ScheduledTaskAction -Execute 'powershell.exe' `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$InstalledScript`" -Apply -NoPersist"
+    $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (Get-PersistenceArgument $IncludeLoginLive)
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $princ   = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest -LogonType ServiceAccount
     $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
