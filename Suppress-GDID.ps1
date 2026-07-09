@@ -110,12 +110,12 @@ function Assert-Admin {
         exit 2
     }
 }
-function Ensure-Dir([string]$d) { if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null } }
+function Initialize-Dir([string]$d) { if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null } }
 function Start-AuditLog([string]$mode) {
-    Ensure-Dir $LogDir
+    Initialize-Dir $LogDir
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $log = "$LogDir\gdid-$mode-$stamp.log"
-    try { Start-Transcript -Path $log -Force | Out-Null } catch {}
+    try { Start-Transcript -Path $log -Force | Out-Null } catch { Write-Verbose $_.Exception.Message }
     return $log
 }
 
@@ -136,7 +136,7 @@ function Test-HostsBlockPresent {
     [bool]((Get-Content $HostsPath) -contains $Sentinel0)
 }
 
-function New-FwBlocks {
+function New-FwBlock {
     foreach ($svc in 'CDPSvc','DoSvc','DiagTrack') {
         $name = "$FwPrefix block $svc out"
         if (-not (Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue)) {
@@ -145,7 +145,7 @@ function New-FwBlocks {
         }
     }
 }
-function Remove-FwBlocks { Get-NetFirewallRule -DisplayName "$FwPrefix*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule }
+function Remove-FwBlock { Get-NetFirewallRule -DisplayName "$FwPrefix*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule }
 
 function Set-SvcStartMode([string]$name,[string]$mode) {
     $map = @{ Disabled=4; Manual=3; Automatic=2; Auto=2; Boot=0; System=1 }
@@ -154,12 +154,12 @@ function Set-SvcStartMode([string]$name,[string]$mode) {
 }
 
 function Save-State {
-    Ensure-Dir $InstallDir
+    Initialize-Dir $InstallDir
     # Load existing so a re-Apply NEVER clobbers the true pre-mitigation originals.
     $saved = @{}
     if (Test-Path $StateFile) {
         try { (Get-Content $StateFile -Raw | ConvertFrom-Json).psobject.Properties |
-              ForEach-Object { $saved[$_.Name] = $_.Value } } catch {}
+              ForEach-Object { $saved[$_.Name] = $_.Value } } catch { Write-Verbose $_.Exception.Message }
     }
     $svc = @{}
     if ($saved.ContainsKey('services') -and $saved.services) {
@@ -181,7 +181,7 @@ function Save-State {
 }
 
 function Install-Persistence {
-    Ensure-Dir $InstallDir
+    Initialize-Dir $InstallDir
     Copy-Item $PSCommandPath $InstalledScript -Force
     $action  = New-ScheduledTaskAction -Execute 'powershell.exe' `
         -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$InstalledScript`" -Apply -NoPersist"
@@ -205,13 +205,13 @@ function Invoke-Apply {
         Save-State
         Write-Host "[A] Producer layer: disabling services" -ForegroundColor Cyan
         foreach ($s in $KillServices) {
-            try { Stop-Service $s -Force -ErrorAction SilentlyContinue } catch {}
+            try { Stop-Service $s -Force -ErrorAction SilentlyContinue } catch { Write-Verbose $_.Exception.Message }
             Set-SvcStartMode $s 'Disabled'
             Write-Host "    $s -> Stopped + Disabled"
         }
         Set-SvcStartMode 'CDPUserSvc' 'Disabled'
         Get-Service -Name 'CDPUserSvc_*' -ErrorAction SilentlyContinue | ForEach-Object {
-            try { Stop-Service $_.Name -Force -ErrorAction SilentlyContinue } catch {}
+            try { Stop-Service $_.Name -Force -ErrorAction SilentlyContinue } catch { Write-Verbose $_.Exception.Message }
             Write-Host "    $($_.Name) -> Stopped"
         }
         Write-Host "[B] Hostname layer: hosts sinkhole" -ForegroundColor Cyan
@@ -219,7 +219,7 @@ function Invoke-Apply {
         Set-HostsBlock $th
         Write-Host "    sinkholed $($th.Count) FQDNs -> 0.0.0.0 / ::"
         Write-Host "[C] Process layer: firewall outbound block by service" -ForegroundColor Cyan
-        New-FwBlocks; Write-Host "    rules: $FwPrefix block {CDPSvc,DoSvc,DiagTrack} out"
+        New-FwBlock; Write-Host "    rules: $FwPrefix block {CDPSvc,DoSvc,DiagTrack} out"
         Write-Host "[D] Policy layer" -ForegroundColor Cyan
         $sysKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
         if (-not (Test-Path $sysKey)) { New-Item $sysKey -Force | Out-Null }
@@ -233,7 +233,7 @@ function Invoke-Apply {
             Install-Persistence
         }
         Write-Host "`nAPPLIED (v$Version). Log: $log" -ForegroundColor Green
-    } finally { try { Stop-Transcript | Out-Null } catch {} }
+    } finally { try { Stop-Transcript | Out-Null } catch { Write-Verbose $_.Exception.Message } }
     exit 0
 }
 
@@ -253,13 +253,13 @@ function Invoke-Undo {
         $cus = if ($st -and $st.cdpUserStart) { $st.cdpUserStart } else { 2 }
         Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\CDPUserSvc' -Name Start -Value $cus -Type DWord -ErrorAction SilentlyContinue
         Write-Host "[B] Removing hosts block" -ForegroundColor Cyan;  Remove-HostsBlock
-        Write-Host "[C] Removing firewall rules" -ForegroundColor Cyan; Remove-FwBlocks
+        Write-Host "[C] Removing firewall rules" -ForegroundColor Cyan; Remove-FwBlock
         Write-Host "[D] Restoring EnableCdp policy" -ForegroundColor Cyan
         $sysKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
         if ($st -and "$($st.enableCdpPrev)" -eq 'ABSENT') { Remove-ItemProperty $sysKey -Name EnableCdp -ErrorAction SilentlyContinue }
         elseif ($st) { Set-ItemProperty $sysKey -Name EnableCdp -Value ([int]$st.enableCdpPrev) -Type DWord }
         Write-Host "`nREVERTED. Reboot to fully restart CDP/DO. Log: $log" -ForegroundColor Green
-    } finally { try { Stop-Transcript | Out-Null } catch {} }
+    } finally { try { Stop-Transcript | Out-Null } catch { Write-Verbose $_.Exception.Message } }
     exit 0
 }
 

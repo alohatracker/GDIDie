@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Static analysis (PSScriptAnalyzer)
+        shell: powershell
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -MinimumVersion 1.22.0
+          $findings = Invoke-ScriptAnalyzer -Path . -Recurse -Settings .\PSScriptAnalyzerSettings.psd1
+          $findings | Format-Table -AutoSize
+          if ($findings) { throw "PSScriptAnalyzer reported $($findings.Count) finding(s)" }
+          Write-Host "Static analysis clean." -ForegroundColor Green
+
+      - name: Unit tests
+        shell: powershell
+        run: |
+          .\Tests\Run-Tests.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Unit tests failed ($LASTEXITCODE)" }
+
+      - name: Parse check
+        shell: powershell
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\Suppress-GDID.ps1), [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { Write-Host $_.Message }; throw "Parse errors" }
+          Write-Host "Parse OK." -ForegroundColor Green

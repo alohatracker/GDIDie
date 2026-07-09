@@ -4,6 +4,7 @@
 
 **Cut the Windows GDID and the device-graph telemetry that carries it — reversibly.**
 
+[![CI](https://github.com/alohatracker/GDIDie/actions/workflows/ci.yml/badge.svg)](https://github.com/alohatracker/GDIDie/actions/workflows/ci.yml)
 ![Platform](https://img.shields.io/badge/platform-Windows_10_%2F_11-0078d6)
 ![Shell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE)
 ![Reversible](https://img.shields.io/badge/reversible-yes_(--Undo)-2ea44f)
