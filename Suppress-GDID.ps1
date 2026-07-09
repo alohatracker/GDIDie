@@ -81,6 +81,9 @@ function Remove-ManagedBlock([string[]]$lines) {
         if ($l -eq $Sentinel1) { $inside = $false; continue }
         if (-not $inside) { $out.Add($l) }
     }
+    # L-1: begin-sentinel without a matching end = corrupt/unbalanced. Do NOT drop the tail;
+    # leave the file untouched rather than silently deleting everything after the begin marker.
+    if ($inside) { return ,$lines }
     ,$out.ToArray()
 }
 function Add-ManagedBlock([string[]]$lines,[string[]]$names) {
@@ -130,9 +133,39 @@ function New-HardenedAcl {
     }
     $acl
 }
+function Test-PathIsReparse([string]$path) {
+    $i = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    [bool]($i -and ($i.Attributes -band [IO.FileAttributes]::ReparsePoint))
+}
+function Test-PathUserWritable([string]$path) {
+    # true if any Allow ACE grants Users/Everyone/Authenticated Users a write-class right.
+    # Mask is write-only bits (no read bits) so Users:ReadAndExecute never false-positives.
+    $wmask = [System.Security.AccessControl.FileSystemRights]'Write,Delete,ChangePermissions,TakeOwnership'
+    [bool]((Get-Acl -LiteralPath $path).Access | Where-Object {
+        $_.AccessControlType -eq 'Allow' -and
+        $_.IdentityReference.Value -match '\\Users$|Everyone|Authenticated Users' -and
+        ($_.FileSystemRights -band $wmask) })
+}
 function Protect-InstallDir {
-    Initialize-Dir $InstallDir
-    try { Set-Acl -Path $InstallDir -AclObject (New-HardenedAcl) } catch { Write-Verbose $_.Exception.Message }
+    # Fail-closed: reject reparse points, create+lock the dir, abort if it stays user-writable.
+    if (Test-Path -LiteralPath $InstallDir) {
+        if (Test-PathIsReparse $InstallDir) { throw "SECURITY: $InstallDir is a reparse point/junction - aborting." }
+    } else {
+        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    }
+    Set-Acl -LiteralPath $InstallDir -AclObject (New-HardenedAcl)   # no swallow: an ACL failure MUST abort
+    if (Test-PathUserWritable $InstallDir) { throw "SECURITY: $InstallDir still user-writable after hardening - aborting." }
+}
+function Protect-InstalledScript {
+    # Close H-1: a pre-planted script file keeps its explicit writable ACE across Copy-Item -Force.
+    # Reject reparse, DELETE any pre-existing file (the new copy then inherits the locked parent DACL),
+    # copy, and verify the file is not user-writable BEFORE any SYSTEM task is registered.
+    if (Test-Path -LiteralPath $InstalledScript) {
+        if (Test-PathIsReparse $InstalledScript) { throw "SECURITY: installed script path is a reparse point - aborting." }
+        Remove-Item -LiteralPath $InstalledScript -Force
+    }
+    Copy-Item -LiteralPath $PSCommandPath -Destination $InstalledScript -Force
+    if (Test-PathUserWritable $InstalledScript) { throw "SECURITY: installed script is user-writable - refusing to register SYSTEM task." }
 }
 function Start-AuditLog([string]$mode) {
     Initialize-Dir $LogDir
@@ -194,9 +227,17 @@ function Save-State {
     }
     $cu = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\CDPUserSvc' -Name Start -ErrorAction SilentlyContinue
     if ($cu -and -not $saved.ContainsKey('cdpUserStart') -and "$($cu.Start)" -ne '4') { $saved['cdpUserStart'] = $cu.Start }
-    if (-not $saved.ContainsKey('enableCdpPrev')) {
-        $ec = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name EnableCdp -ErrorAction SilentlyContinue
-        $saved['enableCdpPrev'] = if ($ec) { $ec.EnableCdp } else { 'ABSENT' }
+    if (-not $saved.ContainsKey('policyPrev')) {
+        # M-3: capture ALL four policy values -Apply changes, first-write-wins, ABSENT if unset.
+        $polKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
+        $pp = @{}
+        foreach ($n in 'EnableCdp','UploadUserActivities','PublishUserActivities','EnableActivityFeed') {
+            $v = Get-ItemProperty $polKey -Name $n -ErrorAction SilentlyContinue
+            $pp[$n] = if ($null -ne $v.$n) { $v.$n } else { 'ABSENT' }
+        }
+        # migrate an older state.json that only saved enableCdpPrev (trust it over the applied value)
+        if ($saved.ContainsKey('enableCdpPrev')) { $pp['EnableCdp'] = $saved.enableCdpPrev }
+        $saved['policyPrev'] = $pp
     }
     $saved['services'] = $svc
     $saved['version']  = $Version
@@ -212,7 +253,7 @@ function Get-PersistenceArgument([bool]$includeLogin) {
 }
 function Install-Persistence {
     Protect-InstallDir
-    Copy-Item $PSCommandPath $InstalledScript -Force
+    Protect-InstalledScript          # H-1/H-2: reparse-safe, fail-closed; aborts if file stays user-writable
     $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (Get-PersistenceArgument $IncludeLoginLive)
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $princ   = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest -LogonType ServiceAccount
@@ -284,10 +325,16 @@ function Invoke-Undo {
         Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\CDPUserSvc' -Name Start -Value $cus -Type DWord -ErrorAction SilentlyContinue
         Write-Host "[B] Removing hosts block" -ForegroundColor Cyan;  Remove-HostsBlock
         Write-Host "[C] Removing firewall rules" -ForegroundColor Cyan; Remove-FwBlock
-        Write-Host "[D] Restoring EnableCdp policy" -ForegroundColor Cyan
+        Write-Host "[D] Restoring policy values" -ForegroundColor Cyan
         $sysKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
-        if ($st -and "$($st.enableCdpPrev)" -eq 'ABSENT') { Remove-ItemProperty $sysKey -Name EnableCdp -ErrorAction SilentlyContinue }
-        elseif ($st) { Set-ItemProperty $sysKey -Name EnableCdp -Value ([int]$st.enableCdpPrev) -Type DWord }
+        $pol = @{}
+        if ($st -and $st.policyPrev) { $st.policyPrev.psobject.Properties | ForEach-Object { $pol[$_.Name] = $_.Value } }
+        elseif ($st -and $null -ne $st.enableCdpPrev) { $pol['EnableCdp'] = $st.enableCdpPrev }   # old state.json
+        foreach ($n in 'EnableCdp','UploadUserActivities','PublishUserActivities','EnableActivityFeed') {
+            if (-not $pol.ContainsKey($n)) { continue }                                            # unknown original: leave as-is
+            if ("$($pol[$n])" -eq 'ABSENT') { Remove-ItemProperty $sysKey -Name $n -ErrorAction SilentlyContinue; Write-Host "    $n -> removed" }
+            else { Set-ItemProperty $sysKey -Name $n -Value ([int]$pol[$n]) -Type DWord; Write-Host "    $n -> $($pol[$n])" }
+        }
         Write-Host "`nREVERTED. Reboot to fully restart CDP/DO. Log: $log" -ForegroundColor Green
     } finally { try { Stop-Transcript | Out-Null } catch { Write-Verbose $_.Exception.Message } }
     exit 0
@@ -317,12 +364,8 @@ function Invoke-Verify {
     Check ($ec -eq 0) ("EnableCdp policy = {0} (want 0)" -f $(if($null -ne $ec){$ec}else{'unset'}))
     $rules = Get-NetFirewallRule -DisplayName "$FwPrefix*" -ErrorAction SilentlyContinue
     Check (@($rules).Count -ge 3) ("firewall rules present: {0}" -f (@($rules).Count))
-    if (Test-Path $InstallDir) {
-        $wr = (Get-Acl $InstallDir).Access | Where-Object {
-            $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -match '\\Users$|Everyone|Authenticated Users' -and
-            ($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Write) }
-        Check (-not $wr) "install dir not writable by standard users"
-    }
+    if (Test-Path $InstallDir) { Check (-not (Test-PathUserWritable $InstallDir)) "install dir not writable by standard users" }
+    if (Test-Path $InstalledScript) { Check (-not (Test-PathUserWritable $InstalledScript)) "installed script not writable by standard users" }
     # The task runs as SYSTEM and is not readable by a standard user, so only check it when elevated.
     $amAdmin = (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if ($amAdmin) { Check ([bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) "persistence task registered" }
@@ -340,6 +383,9 @@ function Invoke-Test {
     Write-Host "`n-- BEFORE --" -ForegroundColor Yellow
     ($proof | ForEach-Object { Test-Endpoint $_ }) | Format-Table -AutoSize | Out-String | Write-Host
     $blocked = 0; $svcFilter = '(none)'
+    # M-2: snapshot the EXACT hosts file so rollback restores a pre-existing applied block
+    # instead of deleting it. Byte-accurate restore, not "remove our block".
+    $hostsSnapshot = if (Test-Path $HostsPath) { [System.IO.File]::ReadAllText($HostsPath) } else { $null }
     try {
         Write-Host "-- APPLYING sinkhole + one firewall rule (CDPSvc) --" -ForegroundColor Yellow
         Set-HostsBlock $proof
@@ -354,7 +400,8 @@ function Invoke-Test {
         Write-Host ("`nVERDICT: {0}/{1} endpoints reachable->blocked; firewall rule scoped to '{2}'." -f $blocked,$after.Count,$svcFilter) -ForegroundColor Green
     } finally {
         Write-Host "`n-- ROLLING BACK (always runs) --" -ForegroundColor Yellow
-        Remove-HostsBlock
+        if ($null -ne $hostsSnapshot) { [System.IO.File]::WriteAllText($HostsPath, $hostsSnapshot, (New-Object System.Text.UTF8Encoding($false))) }
+        else { Remove-HostsBlock }
         Get-NetFirewallRule -DisplayName "$FwPrefix TESTPROBE*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
         Clear-DnsClientCache
         ($proof | ForEach-Object { Test-Endpoint $_ }) | Format-Table -AutoSize | Out-String | Write-Host

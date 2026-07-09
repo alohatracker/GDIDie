@@ -32,6 +32,18 @@ try {
 
     $sys = $rules | Where-Object { $_.IdentityReference.Value -match 'SYSTEM' -and $_.FileSystemRights -eq 'FullControl' }
     Assert ([bool]$sys) 'SYSTEM retains FullControl'
+
+    # H-1 detector: false on the locked dir; true when a Users:Modify ACE exists.
+    # (The 'writable' case runs on a fresh unhardened dir; hardening $tmp would lock the runner out of its own ACL.)
+    Assert (-not (Test-PathUserWritable $tmp)) 'Test-PathUserWritable: false on hardened dir'
+    $tmp2 = Join-Path ([IO.Path]::GetTempPath()) ("gdidie-smoke2-" + [Guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $tmp2 -Force | Out-Null
+    try {
+        $a2 = Get-Acl $tmp2
+        $a2.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\Users','Modify','ContainerInherit,ObjectInherit','None','Allow')))
+        Set-Acl $tmp2 $a2
+        Assert (Test-PathUserWritable $tmp2) 'Test-PathUserWritable: true when a Users:Modify ACE is present'
+    } finally { Remove-Item $tmp2 -Recurse -Force -ErrorAction SilentlyContinue }
 } finally {
     if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
 }

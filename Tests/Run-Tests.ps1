@@ -64,6 +64,13 @@ Assert ((Get-PersistenceArgument $false) -match '-Apply -NoPersist') 'boot task 
 Assert ((Get-PersistenceArgument $false) -notmatch 'IncludeLoginLive') 'default: boot task does NOT block login.live.com'
 Assert ((Get-PersistenceArgument $true) -match '-IncludeLoginLive') 'opt-in: boot task carries -IncludeLoginLive so the block persists'
 
+Write-Host "unbalanced sentinel safety (L-1)" -ForegroundColor Cyan
+$broken = @('127.0.0.1 localhost', $Sentinel0, '0.0.0.0 evil.example', 'important.tail.line')  # begin, no end
+$res = Remove-ManagedBlock $broken
+Assert ((($res -join "`n")) -eq ($broken -join "`n")) 'begin-without-end leaves the file unchanged (no tail drop)'
+$balanced = @('127.0.0.1 localhost', $Sentinel0, '0.0.0.0 x', $Sentinel1, 'keep.me')
+Assert (((Remove-ManagedBlock $balanced) -join "`n") -eq "127.0.0.1 localhost`nkeep.me") 'balanced block still strips correctly'
+
 Write-Host ""
 Write-Host ("RESULT: {0} passed, {1} failed" -f $script:Pass,$script:Fail) -ForegroundColor $(if($script:Fail){'Red'}else{'Green'})
 exit ([int]($script:Fail -gt 0))
