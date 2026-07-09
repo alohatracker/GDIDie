@@ -44,6 +44,21 @@ Assert (-not $h2.ContainsKey('DoSvc')) 'skip: already-disabled is never recorded
 $h3 = @{ Existing = 'Manual' }; Update-SavedOriginal $h3 'New' 'Auto' 'Disabled' | Out-Null
 Assert (($h3['Existing'] -eq 'Manual') -and ($h3['New'] -eq 'Auto')) 'independent keys coexist'
 
+Write-Host "install-dir ACL hardening" -ForegroundColor Cyan
+$acl = New-HardenedAcl
+Assert ($acl.AreAccessRulesProtected) 'inheritance disabled (protected DACL)'
+$ar = $acl.GetAccessRules($true,$false,[System.Security.Principal.SecurityIdentifier])
+$users = $ar | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-32-545' }
+$usersRx = $users -and ($users.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::ReadAndExecute)
+Assert ([bool]$usersRx) 'Users have ReadAndExecute'
+$usersWrite = $ar | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-32-545' -and ($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Write) }
+Assert (-not $usersWrite) 'Users have NO write/create on the install dir'
+$sys = $ar | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-18' }
+Assert ($sys.FileSystemRights -eq 'FullControl') 'SYSTEM = FullControl'
+$adm = $ar | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-32-544' }
+Assert ($adm.FileSystemRights -eq 'FullControl') 'Administrators = FullControl'
+Assert (($ar | Where-Object { $_.IdentityReference.Value -eq 'S-1-1-0' }).Count -eq 0) 'no Everyone ACE'
+
 Write-Host ""
 Write-Host ("RESULT: {0} passed, {1} failed" -f $script:Pass,$script:Fail) -ForegroundColor $(if($script:Fail){'Red'}else{'Green'})
 exit ([int]($script:Fail -gt 0))

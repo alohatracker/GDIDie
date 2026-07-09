@@ -86,7 +86,7 @@ Run elevated. If you double-click or run non-elevated, it prints the elevated co
 
 ### Durability, logging, exit codes
 
-- **Persistence:** `-Apply` installs a copy to `%ProgramData%\SuppressGDID\` and registers a SYSTEM scheduled task **`GDIDie-Enforce`** that re-applies at startup — so a Windows feature update that re-enables `CDPSvc` gets re-blocked. `-Undo` removes it.
+- **Persistence:** `-Apply` installs a copy to `%ProgramData%\SuppressGDID\` (locked to an explicit SYSTEM/Admin-full, Users-read-only DACL — see [SECURITY-AUDIT.md](SECURITY-AUDIT.md) H-1) and registers a SYSTEM scheduled task **`GDIDie-Enforce`** that re-applies at startup — so a Windows feature update that re-enables `CDPSvc` gets re-blocked. `-Undo` removes it.
 - **Audit log:** every `-Apply`/`-Undo` writes a timestamped transcript to `%ProgramData%\SuppressGDID\logs\`.
 - **Automation:** `-Verify` returns exit `0` (all pass) or `1` (any fail); `Assert-Admin` exits `2`. Gate CI/Intune/SCCM on these. (Run `-Verify` elevated to include the SYSTEM task check; non-elevated it is skipped, not failed.)
 - **State safety:** `state.json` is merged first-write-wins, so re-running `-Apply` never overwrites the true pre-mitigation values (regression fixed in v1.1.0).

@@ -1,6 +1,6 @@
 <#
     Suppress-GDID.ps1  --  Kill the Windows GDID / device-graph telemetry vector.
-    Version 1.1.0
+    Version 1.2.0
 
     The GDID is a server-assigned MSA Device PUID (0018-class). Chain:
         wlidsvc  --provisions-->  login.live.com  --returns PUID-->  registry
@@ -36,7 +36,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Version    = '1.1.0'
+$Version    = '1.2.0'
 $HostsPath  = "$env:SystemRoot\System32\drivers\etc\hosts"
 $InstallDir = "$env:ProgramData\SuppressGDID"
 $StateFile  = "$InstallDir\state.json"
@@ -111,6 +111,29 @@ function Assert-Admin {
     }
 }
 function Initialize-Dir([string]$d) { if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null } }
+
+function New-HardenedAcl {
+    # Explicit DACL for the install dir: SYSTEM/Administrators full, standard Users read-only,
+    # inheritance disabled. Closes the writable-directory-feeding-a-SYSTEM-task weakness so a
+    # standard user cannot place files in the folder the GDIDie-Enforce SYSTEM task runs from.
+    # Pure (no filesystem) so it is unit-testable.
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)   # protect from inheritance; drop inherited ACEs
+    $inh   = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
+    $none  = [System.Security.AccessControl.PropagationFlags]::None
+    $allow = [System.Security.AccessControl.AccessControlType]::Allow
+    $full  = [System.Security.AccessControl.FileSystemRights]::FullControl
+    $rx    = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+    foreach ($r in @(@{Sid='S-1-5-18';R=$full}, @{Sid='S-1-5-32-544';R=$full}, @{Sid='S-1-5-32-545';R=$rx})) {
+        $sid = New-Object System.Security.Principal.SecurityIdentifier($r.Sid)
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid,$r.R,$inh,$none,$allow)))
+    }
+    $acl
+}
+function Protect-InstallDir {
+    Initialize-Dir $InstallDir
+    try { Set-Acl -Path $InstallDir -AclObject (New-HardenedAcl) } catch { Write-Verbose $_.Exception.Message }
+}
 function Start-AuditLog([string]$mode) {
     Initialize-Dir $LogDir
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -154,7 +177,7 @@ function Set-SvcStartMode([string]$name,[string]$mode) {
 }
 
 function Save-State {
-    Initialize-Dir $InstallDir
+    Protect-InstallDir
     # Load existing so a re-Apply NEVER clobbers the true pre-mitigation originals.
     $saved = @{}
     if (Test-Path $StateFile) {
@@ -181,7 +204,7 @@ function Save-State {
 }
 
 function Install-Persistence {
-    Initialize-Dir $InstallDir
+    Protect-InstallDir
     Copy-Item $PSCommandPath $InstalledScript -Force
     $action  = New-ScheduledTaskAction -Execute 'powershell.exe' `
         -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$InstalledScript`" -Apply -NoPersist"
@@ -200,6 +223,7 @@ function Remove-Persistence {
 # --- modes -----------------------------------------------------------------
 function Invoke-Apply {
     Assert-Admin
+    Protect-InstallDir                 # lock the install dir BEFORE writing anything into it
     $log = Start-AuditLog 'apply'
     try {
         Save-State
@@ -287,6 +311,12 @@ function Invoke-Verify {
     Check ($ec -eq 0) ("EnableCdp policy = {0} (want 0)" -f $(if($null -ne $ec){$ec}else{'unset'}))
     $rules = Get-NetFirewallRule -DisplayName "$FwPrefix*" -ErrorAction SilentlyContinue
     Check (@($rules).Count -ge 3) ("firewall rules present: {0}" -f (@($rules).Count))
+    if (Test-Path $InstallDir) {
+        $wr = (Get-Acl $InstallDir).Access | Where-Object {
+            $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -match '\\Users$|Everyone|Authenticated Users' -and
+            ($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Write) }
+        Check (-not $wr) "install dir not writable by standard users"
+    }
     # The task runs as SYSTEM and is not readable by a standard user, so only check it when elevated.
     $amAdmin = (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if ($amAdmin) { Check ([bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) "persistence task registered" }

@@ -29,6 +29,12 @@ jobs:
           .\Tests\Run-Tests.ps1
           if ($LASTEXITCODE -ne 0) { throw "Unit tests failed ($LASTEXITCODE)" }
 
+      - name: Smoke test (install-dir hardening on a real dir)
+        shell: powershell
+        run: |
+          .\Tests\Smoke-Test.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Smoke test failed ($LASTEXITCODE)" }
+
       - name: Parse check
         shell: powershell
         run: |
