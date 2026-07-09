@@ -1,6 +1,6 @@
 <#
     Suppress-GDID.ps1  --  Kill the Windows GDID / device-graph telemetry vector.
-    Version 1.2.0
+    Version 1.3.0
 
     The GDID is a server-assigned MSA Device PUID (0018-class). Chain:
         wlidsvc  --provisions-->  login.live.com  --returns PUID-->  registry
@@ -36,7 +36,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Version    = '1.2.0'
+$Version    = '1.3.0'
 $HostsPath  = "$env:SystemRoot\System32\drivers\etc\hosts"
 $InstallDir = "$env:ProgramData\SuppressGDID"
 $StateFile  = "$InstallDir\state.json"
