@@ -476,6 +476,31 @@ foreach ($vid in 'V-1','V-2','V-3','V-4') {
     Assert-Finding $vid ($AuditDoc -match [regex]::Escape($vid)) ("SECURITY-AUDIT.md documents $vid")
 }
 
+Section 'V-5  a workflow that YAML rejects must not be able to masquerade as a pass'
+$wfFiles = @(Get-ChildItem -LiteralPath (Join-Path $Repo '.github/workflows') -Filter '*.yml' -File -ErrorAction SilentlyContinue)
+Assert-Finding 'V-5' ($wfFiles.Count -ge 2)                                                           'the workflow directory holds the CI and integration lanes'
+# every step name must be quoted or colon-free, or GitHub discards the entire file
+$unsafeNames = @()
+foreach ($wf in $wfFiles) {
+    $lines = @(Get-Content -LiteralPath $wf.FullName)
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^\s*-?\s*name:\s*(.+)$') {
+            $val = $Matches[1].Trim()
+            if ($val -notmatch '^[''"]' -and $val -match ':\s') { $unsafeNames += ("{0}:{1}" -f $wf.Name,($i+1)) }
+        }
+    }
+}
+Assert-Finding 'V-5' ($unsafeNames.Count -eq 0) ("no workflow step name would break YAML parsing{0}" -f $(if ($unsafeNames.Count) { ": $($unsafeNames -join ', ')" } else { '' }))
+Assert-Finding 'V-5' ($loopText -match 'YAML will reject the whole file')                             'the loop parse stage lints the workflows, not just the scripts'
+Assert-Finding 'V-5' ($loopText -match 'workflow\(s\) lint clean')                                    'the parse stage reports how many workflows it linted'
+$integ = Get-DocText '.github/workflows/integration.yml'
+Assert-Finding 'V-5' ($integ -ne '')                                                                  'the integration workflow exists'
+Assert-Finding 'V-5' ($integ -match 'Suppress-GDID\.ps1 -Apply')                                      'it actually executes -Apply on a real Windows runner'
+Assert-Finding 'V-5' ($integ -match 'S-1-5-32-544')                                                   'it asserts real on-disk ownership (the V-1 class) after -Apply'
+Assert-Finding 'V-5' ($integ -match 'expected 4 \(Disabled\)')                                        'it reads the service start types back from the registry'
+Assert-Finding 'V-5' ($integ -match 'expected 0 \(all pass\)|expected 0 \(all-pass\)|all-pass')       'it requires -Verify to be all-pass after apply'
+Assert-Finding 'V-5' ($integ -match 'expected 4 \(refused\)')                                         'it proves -Undo refuses with exit 4 and changes nothing'
+
 Section 'VR-1  install-dir ownership must be asserted, not just the DACL'
 # the trusted-owner set is exactly SYSTEM + Administrators (behavioural, cross-platform)
 Assert-Finding 'VR-1' ((@($script:TrustedOwnerSids | Sort-Object) -join ',') -eq 'S-1-5-18,S-1-5-32-544') 'only SYSTEM and Administrators are trusted owners'

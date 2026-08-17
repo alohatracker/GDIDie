@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Environment + elevation (the whole run depends on this)
+      - name: "Environment + elevation (the whole run depends on this)"
         shell: powershell
         run: |
           $p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -39,7 +39,7 @@ jobs:
           }
           if (-not $elevated) { throw "Runner is not elevated - the mutating steps cannot be validated here." }
 
-      - name: -Verify before anything (expect failures, must not crash)
+      - name: "-Verify before anything (expect failures, must not crash)"
         shell: powershell
         run: |
           .\Suppress-GDID.ps1 -Verify
@@ -50,7 +50,7 @@ jobs:
           if ($code -ne 1 -and $code -ne 0) { throw "-Verify returned $code before apply; expected 0 or 1" }
           exit 0
 
-      - name: -Test (reversible live probe, must roll back cleanly)
+      - name: "-Test (reversible live probe, must roll back cleanly)"
         shell: powershell
         run: |
           $hostsBefore = [IO.File]::ReadAllBytes("$env:SystemRoot\System32\drivers\etc\hosts")
@@ -65,7 +65,7 @@ jobs:
           Write-Host "hosts restored byte-for-byte; no rules left behind"
           exit 0
 
-      - name: -Apply (THE step V-1 broke; must exit 0 with no SECURITY: throw)
+      - name: "-Apply (THE step V-1 broke; must exit 0 with no SECURITY: throw)"
         shell: powershell
         run: |
           $out = .\Suppress-GDID.ps1 -Apply 2>&1 | Out-String
@@ -76,7 +76,7 @@ jobs:
           if ($code -ne 0) { throw "-Apply returned $code, expected 0" }
           exit 0
 
-      - name: Inspect what -Apply actually did on disk and in the registry
+      - name: "Inspect what -Apply actually did on disk and in the registry"
         shell: powershell
         run: |
           $dir = "$env:ProgramData\SuppressGDID"
@@ -158,7 +158,7 @@ jobs:
           if ($fail.Count) { $fail | ForEach-Object { Write-Host "FAIL: $_" }; throw "$($fail.Count) post-apply assertion(s) failed" }
           Write-Host "`nall post-apply assertions passed"
 
-      - name: -Verify after apply (must be all-pass, exit 0)
+      - name: "-Verify after apply (must be all-pass, exit 0)"
         shell: powershell
         run: |
           $out = .\Suppress-GDID.ps1 -Verify 2>&1 | Out-String
@@ -170,7 +170,7 @@ jobs:
           if ($out -notmatch 'does NOT make you anonymous') { throw "-Verify did not print the honest ceiling on a passing run" }
           exit 0
 
-      - name: -Apply again (idempotency + first-write-wins state guard)
+      - name: "-Apply again (idempotency + first-write-wins state guard)"
         shell: powershell
         run: |
           $before = Get-Content "$env:ProgramData\SuppressGDID\state.json" -Raw
@@ -191,7 +191,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "-Verify failed after re-apply" }
           exit 0
 
-      - name: -Undo (must exit 0 and restore the recorded originals)
+      - name: "-Undo (must exit 0 and restore the recorded originals)"
         shell: powershell
         run: |
           $state = Get-Content "$env:ProgramData\SuppressGDID\state.json" -Raw | ConvertFrom-Json
@@ -224,7 +224,7 @@ jobs:
           if ($fail.Count) { $fail | ForEach-Object { Write-Host "FAIL: $_" }; throw "$($fail.Count) post-undo assertion(s) failed" }
           Write-Host "`nall post-undo assertions passed"
 
-      - name: -Undo with no state file (must REFUSE with exit 4, change nothing)
+      - name: "-Undo with no state file (must REFUSE with exit 4, change nothing)"
         shell: powershell
         run: |
           .\Suppress-GDID.ps1 -Apply | Out-Null
@@ -243,7 +243,7 @@ jobs:
           Write-Host "refused cleanly and changed nothing"
           exit 0
 
-      - name: -Undo -Force (documented defaults) then confirm reverted
+      - name: "-Undo -Force (documented defaults) then confirm reverted"
         shell: powershell
         run: |
           $out = .\Suppress-GDID.ps1 -Undo -Force 2>&1 | Out-String
@@ -256,7 +256,7 @@ jobs:
           if ($code -eq 0) { throw "-Verify still reports all-pass after -Undo" }
           exit 0
 
-      - name: Cleanup (best effort; the runner is discarded anyway)
+      - name: "Cleanup (best effort; the runner is discarded anyway)"
         if: always()
         shell: powershell
         run: |

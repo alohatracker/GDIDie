@@ -239,6 +239,15 @@
             Rationale   = 'Start-Transcript fails when the session is already transcribing. That failure was swallowed, then the finally block stopped whatever transcript WAS running - the operator own.'
         }
 
+        @{  Id          = 'V-5'
+            Severity    = 'High'
+            Title       = 'A malformed workflow YAML is discarded by GitHub before any job runs, so a validation lane silently does not exist'
+            Disposition = 'Fixed'
+            Platform    = 'Any'
+            Fix         = 'Every step name in the workflows is quoted, and the audit loop parse stage now lints .github/workflows/*.yml for the defect class - an unquoted scalar containing a colon-space, which YAML reads as a nested mapping - plus the presence of on: and jobs: blocks.'
+            Rationale   = 'The integration workflow was rejected at startup because a step name contained "no SECURITY: throw". The run reported failure with ZERO jobs, produced no check run, and would have been trivially mistaken for not-applicable. Same shape as H-A: a check that never ran, presenting as fine.'
+        }
+
         # --- VR pass (adversarial LPE audit) ----------------------------------------------------
         @{  Id          = 'VR-1'
             Severity    = 'High'

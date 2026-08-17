@@ -95,8 +95,31 @@ if (& $want 'parse') {
         if ($errs) { $bad += ("{0}:{1} {2}" -f $f.Name,$errs[0].Extent.StartLineNumber,$errs[0].Message) }
     }
     $count = @(Get-ChildItem -LiteralPath $Repo -Recurse -Filter '*.ps1' -File).Count
+    # V-5: a malformed workflow is DISCARDED by GitHub before any job is created - zero jobs, no
+    # check run, which is indistinguishable from "this workflow did not apply" and reads as success.
+    # A validation step that silently does not run is the H-A defect wearing a different hat, so lint
+    # the workflow files here too. Windows PowerShell 5.1 ships no YAML parser, so this targets the
+    # specific class that actually bit: an unquoted scalar containing ': ', which YAML parses as a
+    # nested mapping and rejects.
+    $wfDir = Join-Path $Repo '.github/workflows'
+    $wfCount = 0
+    foreach ($wf in @(Get-ChildItem -LiteralPath $wfDir -Filter '*.yml' -File -ErrorAction SilentlyContinue)) {
+        $wfCount++
+        $lines = @(Get-Content -LiteralPath $wf.FullName)
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^\s*-?\s*(name|description):\s*(.+)$') {
+                $val = $Matches[2].Trim()
+                if ($val -notmatch '^[''"]' -and $val -match ':\s') {
+                    $bad += ("{0}:{1} unquoted value contains ': ' so YAML will reject the whole file -> {2}" -f $wf.Name,($i+1),$val)
+                }
+            }
+        }
+        $text = ($lines -join "`n")
+        if ($text -notmatch '(?m)^jobs:') { $bad += ("{0} has no jobs: block" -f $wf.Name) }
+        if ($text -notmatch '(?m)^on:')   { $bad += ("{0} has no on: trigger block" -f $wf.Name) }
+    }
     if ($bad.Count) { Add-Stage 'parse' 'FAIL' ($bad -join '; ') }
-    else            { Add-Stage 'parse' 'PASS' ("$count script(s) parse clean") }
+    else            { Add-Stage 'parse' 'PASS' ("$count script(s) parse clean, $wfCount workflow(s) lint clean") }
 }
 
 # --- 2. static analysis -----------------------------------------------------
