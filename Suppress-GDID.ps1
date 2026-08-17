@@ -402,18 +402,25 @@ function Write-Ceiling {
     Write-Host "  ------------------------------------------------------------------------" -ForegroundColor Yellow
 }
 
+function Clear-DnsCache {
+    # Thin wrapper over Clear-DnsClientCache so the hosts-file lifecycle is exercisable off Windows,
+    # where that cmdlet does not exist. The tests used to shadow the cmdlet itself, which trips
+    # PSScriptAnalyzer's PSAvoidOverwritingBuiltInCmdlets - a wrapper is the right seam.
+    if (Get-Command Clear-DnsClientCache -ErrorAction SilentlyContinue) { Clear-DnsClientCache }
+    else { Write-Verbose 'Clear-DnsClientCache unavailable on this platform - skipping DNS cache flush.' }
+}
 function Set-HostsBlock([string[]]$names) {
     $lines = if (Test-Path $HostsPath) { Get-Content $HostsPath } else { @() }
     $new = Add-ManagedBlock $lines $names
     [System.IO.File]::WriteAllLines($HostsPath, $new, (New-Object System.Text.UTF8Encoding($false)))
-    Clear-DnsClientCache
+    Clear-DnsCache
 }
 function Remove-HostsBlock {
     $lines = if (Test-Path $HostsPath) { Get-Content $HostsPath } else { @() }
     if (Test-ManagedBlockCorrupt $lines) { Write-Warning "hosts managed block is corrupt - leaving the hosts file untouched (fix it manually)."; return }
     $new = Remove-ManagedBlock $lines
     [System.IO.File]::WriteAllLines($HostsPath, $new, (New-Object System.Text.UTF8Encoding($false)))
-    Clear-DnsClientCache
+    Clear-DnsCache
 }
 function Test-HostsBlockPresent {
     if (-not (Test-Path $HostsPath)) { return $false }
@@ -873,7 +880,7 @@ function Invoke-Test {
         Set-HostsBlock $proof
         New-NetFirewallRule -DisplayName "$FwPrefix TESTPROBE CDPSvc out" -Direction Outbound -Action Block `
             -Service CDPSvc -Profile Any -Enabled True | Out-Null
-        Start-Sleep -Milliseconds 500; Clear-DnsClientCache
+        Start-Sleep -Milliseconds 500; Clear-DnsCache
         Write-Host "-- AFTER --" -ForegroundColor Yellow
         $after = @($proof | ForEach-Object { Test-Endpoint $_ })
         $after | Format-Table -AutoSize | Out-String | Write-Host
@@ -892,7 +899,7 @@ function Invoke-Test {
         if ($null -ne $hostsSnapshot) { [System.IO.File]::WriteAllBytes($HostsPath, $hostsSnapshot) }
         elseif (Test-Path -LiteralPath $HostsPath) { Remove-Item -LiteralPath $HostsPath -Force }   # F5: file did not exist pre-test
         Get-NetFirewallRule -DisplayName "$FwPrefix TESTPROBE*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-        Clear-DnsClientCache
+        Clear-DnsCache
         ($proof | ForEach-Object { Test-Endpoint $_ }) | Format-Table -AutoSize | Out-String | Write-Host
         Write-Host "Hosts file and firewall restored to pre-test state." -ForegroundColor Green
         if (-not $installExisted) {

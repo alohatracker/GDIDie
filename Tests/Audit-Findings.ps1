@@ -353,6 +353,30 @@ $metaText = Get-DocText 'Tests/Test-AuditLoop.ps1'
 Assert-Finding 'A-10' ($metaText -ne '')                                                              'a meta-test for the loop itself exists'
 Assert-Finding 'A-10' ($metaText -match 'UNVALIDATED' -and $metaText -match 'unregistered finding')   'it covers both coverage-gate failure modes'
 Assert-Finding 'A-10' ($metaText -match 'control: an unmodified copy passes')                         'it has a control case, so a failure means the injected defect'
+# A-12: the harness must run on the runtime the tool targets. Both of these actually broke the
+# Windows lane on the first CI run while the Linux lane was green, which is the whole reason the
+# Windows lane exists - so they are pinned rather than just fixed.
+$psFiles = @(Get-ChildItem -LiteralPath $Repo -Recurse -Filter '*.ps1' -File | Where-Object { $_.FullName -notmatch '\.git' })
+$threeArgJoin = @($psFiles | Where-Object {
+    @(Get-Content -LiteralPath $_.FullName | Where-Object { $_ -match "Join-Path\s+[^\s(|;]+\s+'[^']*'\s+'[^']*'" }).Count -gt 0
+} | ForEach-Object { $_.Name })
+Assert-Finding 'A-12' ($threeArgJoin.Count -eq 0) ("no 3-segment Join-Path (-AdditionalChildPath is PowerShell 6+, absent in the 5.1 target){0}" -f $(if ($threeArgJoin.Count) { ": $($threeArgJoin -join ', ')" } else { '' }))
+$shadowed = @()
+foreach ($f in $psFiles) {
+    $fa = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+    foreach ($fn in @($fa.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))) {
+        # a function that shadows a shipped cmdlet trips PSAvoidOverwritingBuiltInCmdlets; the tool
+        # wraps the platform-specific cmdlet instead (Clear-DnsCache), which is the correct seam.
+        if ($fn.Name -in @('Clear-DnsClientCache','Get-Acl','Set-Acl','Get-Service','Stop-Service','Get-Content','Set-Content','Test-Path','Join-Path')) {
+            $shadowed += ("{0}:{1}" -f $f.Name,$fn.Name)
+        }
+    }
+}
+Assert-Finding 'A-12' ($shadowed.Count -eq 0) ("no test shadows a shipped cmdlet{0}" -f $(if ($shadowed.Count) { ": $($shadowed -join ', ')" } else { '' }))
+Assert-Finding 'A-12' ([bool](Get-Fn 'Clear-DnsCache'))                                               'the resolver flush is wrapped, so the hosts lifecycle is testable without shadowing'
+$loopChild = Get-DocText 'Tests/Invoke-AuditLoop.ps1'
+Assert-Finding 'A-12' ($loopChild -match "ErrorActionPreference = 'Continue'")                        'child stderr produces a FAIL stage instead of aborting the loop mid-run'
+Assert-Finding 'A-12' ($loopChild -match 'Get-ChildFailureLine')                                      'a crashing child is diagnosable from one run'
 if ($onWindows) { Assert-Finding 'A-10' $true 'running the Windows lane: ACL assertions are live' }
 else            { Write-SkippedFinding 'A-10' 'ACL assertion liveness' 'non-Windows lane; CI Windows job covers it' }
 

@@ -78,8 +78,9 @@ it is a build failure.
    the deliverable *is* the disclosure.
 
 Where a fix needs a Windows-only side effect, the seam is stubbed rather than skipped: `A-7` shadows
-`Test-PathUserWritable` to test the state-file *classification* logic on both lanes, and the smoke
-test shadows `Clear-DnsClientCache` to exercise the real hosts-file lifecycle on Linux.
+`Test-PathUserWritable` to test the state-file *classification* logic on both lanes, and the tool wraps
+the Windows-only resolver flush as `Clear-DnsCache` so the real hosts-file lifecycle runs on Linux
+too (wrapping beats shadowing the built-in cmdlet, which the analyzer rightly rejects).
 
 ## Adding a finding
 

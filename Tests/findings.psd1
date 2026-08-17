@@ -186,6 +186,15 @@
             Rationale   = 'Same principle as H-A applied to the harness: never report a pass for something that did not run.'
         }
 
+        @{  Id          = 'A-12'
+            Severity    = 'Medium'
+            Title       = 'The harness itself was not runtime-clean on Windows PowerShell 5.1, the version the tool targets'
+            Disposition = 'Fixed'
+            Platform    = 'Any'
+            Fix         = 'Three-segment Join-Path (-AdditionalChildPath, PowerShell 6+) replaced with nested two-argument calls; the tests no longer shadow Clear-DnsClientCache (the tool wraps it as Clear-DnsCache); and Invoke-Child drops to ErrorActionPreference Continue so a child writing to stderr yields a FAIL stage instead of a terminating NativeCommandError that kills the run before the coverage table prints.'
+            Rationale   = 'Found by the Windows CI lane on the first run while the Linux lane was green - exactly the split the two lanes exist for. Pinned so a PowerShell-7-only idiom cannot creep back into a 5.1 tool.'
+        }
+
         # --- deliberate residuals ---------------------------------------------------------------
         @{  Id          = 'I-2'
             Severity    = 'Info'

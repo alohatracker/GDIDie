@@ -63,8 +63,22 @@ function Invoke-Child([string]$scriptPath,[string[]]$extra) {
     if ($onWindows) { $argList += @('-ExecutionPolicy','Bypass') }
     $argList += @('-File',$scriptPath)
     if ($extra) { $argList += $extra }
-    $out = & $exe @argList 2>&1
+    # A child that writes to stderr must produce a FAIL stage, not abort the whole loop. Under
+    # $ErrorActionPreference='Stop', '2>&1' from a native command surfaces as a TERMINATING
+    # NativeCommandError in Windows PowerShell 5.1, which would kill the run before the remaining
+    # stages and the coverage table ever printed.
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { $out = & $exe @argList 2>&1 } finally { $ErrorActionPreference = $prev }
     @{ Code = $LASTEXITCODE; Output = @($out) }
+}
+function Get-ChildFailureLine($output) {
+    # Prefer the suite's own [FAIL] lines; fall back to raw stderr so a crashing child is still
+    # diagnosable from one run instead of needing a second, more verbose one.
+    $lines = @($output | ForEach-Object { "$_" })
+    $marked = @($lines | Where-Object { $_ -match '\[FAIL\]' })
+    if ($marked.Count) { return $marked }
+    @($lines | Where-Object { $_ -match '\S' } | Select-Object -Last 12)
 }
 function Write-ChildOutput($lines) { foreach ($l in $lines) { Write-Host ("    | {0}" -f $l) } }
 
@@ -107,7 +121,8 @@ if (& $want 'analyzer') {
 if (& $want 'unit') {
     $r = Invoke-Child (Join-Path $PSScriptRoot 'Run-Tests.ps1')
     $summary = @($r.Output | Where-Object { $_ -match '^RESULT:' }) -join ' '
-    if ($r.Code -ne 0) { Write-ChildOutput @($r.Output | Where-Object { $_ -match '\[FAIL\]' }); Add-Stage 'unit' 'FAIL' $summary }
+    if (-not $summary) { $summary = "child exited $($r.Code) without a RESULT line" }
+    if ($r.Code -ne 0) { Write-ChildOutput (Get-ChildFailureLine $r.Output); Add-Stage 'unit' 'FAIL' $summary }
     else               { Add-Stage 'unit' 'PASS' $summary }
     foreach ($s in @($r.Output | Where-Object { $_ -match '\[SKIP\]' })) { Add-Stage 'unit' 'SKIP' ("$s".Trim()) }
 }
@@ -116,7 +131,8 @@ if (& $want 'unit') {
 if (& $want 'smoke') {
     $r = Invoke-Child (Join-Path $PSScriptRoot 'Smoke-Test.ps1')
     $summary = @($r.Output | Where-Object { $_ -match '^SMOKE:' }) -join ' '
-    if ($r.Code -ne 0) { Write-ChildOutput @($r.Output | Where-Object { $_ -match '\[FAIL\]' }); Add-Stage 'smoke' 'FAIL' $summary }
+    if (-not $summary) { $summary = "child exited $($r.Code) without a SMOKE line" }
+    if ($r.Code -ne 0) { Write-ChildOutput (Get-ChildFailureLine $r.Output); Add-Stage 'smoke' 'FAIL' $summary }
     else               { Add-Stage 'smoke' 'PASS' $summary }
     foreach ($s in @($r.Output | Where-Object { $_ -match '\[SKIP\]' })) { Add-Stage 'smoke' 'SKIP' ("$s".Trim()) }
 }
@@ -128,8 +144,9 @@ if (& $want 'findings') {
     try {
         $r = Invoke-Child (Join-Path $PSScriptRoot 'Audit-Findings.ps1') @('-ReportPath',$tmp)
         $summary = @($r.Output | Where-Object { $_ -match '^FINDINGS:' }) -join ' '
+        if (-not $summary) { $summary = "child exited $($r.Code) without a FINDINGS line" }
         if ($r.Code -ne 0) {
-            Write-ChildOutput @($r.Output | Where-Object { $_ -match '\[FAIL\] [A-Z]-' })
+            Write-ChildOutput (Get-ChildFailureLine $r.Output)
             Add-Stage 'findings' 'FAIL' $summary
         } else {
             Add-Stage 'findings' 'PASS' $summary

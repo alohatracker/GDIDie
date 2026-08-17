@@ -18,7 +18,7 @@ function Skip([string]$name,[string]$why) {
 }
 
 # dot-source the tool: dispatcher is guarded, so only functions + vars load
-. (Join-Path $PSScriptRoot '..' 'Suppress-GDID.ps1')
+. (Join-Path (Join-Path $PSScriptRoot '..') 'Suppress-GDID.ps1')
 $onWindows = Test-IsWindowsHost
 
 Write-Host "hosts block helpers" -ForegroundColor Cyan

@@ -16,13 +16,8 @@ $script:pass = 0; $script:fail = 0; $script:skip = 0
 function Assert([bool]$c,[string]$n){ if($c){$script:pass++;Write-Host "  [PASS] $n" -ForegroundColor Green}else{$script:fail++;Write-Host "  [FAIL] $n" -ForegroundColor Red} }
 function Skip([string]$n,[string]$why){ $script:skip++; Write-Host "  [SKIP] $n ($why)" -ForegroundColor Yellow }
 
-. (Join-Path $PSScriptRoot '..' 'Suppress-GDID.ps1')
+. (Join-Path (Join-Path $PSScriptRoot '..') 'Suppress-GDID.ps1')
 $onWindows = Test-IsWindowsHost
-if (-not $onWindows) {
-    # Test seam: Set-HostsBlock flushes the resolver cache, which does not exist off Windows.
-    # Shadowing it here keeps the hosts-file lifecycle testable on the Linux lane.
-    function Clear-DnsClientCache { }
-}
 function New-TempDir([string]$tag) {
     $p = Join-Path ([IO.Path]::GetTempPath()) ("gdidie-$tag-" + [Guid]::NewGuid().ToString('N').Substring(0,8))
     New-Item -ItemType Directory -Path $p -Force | Out-Null
