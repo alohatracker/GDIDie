@@ -206,6 +206,15 @@ function Select-PruneTarget([string[]]$namesNewestFirst,[int]$keep) {
     if ($n.Count -le $keep) { return @() }
     $n[$keep..($n.Count-1)]
 }
+function ConvertTo-IntOrNull($value) {
+    # V-3: values read back out of state.json are data, not trusted code. A bare [int] cast on a
+    # malformed value THROWS, and -Undo built its plans after already removing the persistence task,
+    # so one bad field left the machine half-reverted. Convert defensively and let the caller decide.
+    if ($null -eq $value) { return $null }
+    $n = 0
+    if ([int]::TryParse("$value", [ref]$n)) { return $n }
+    $null
+}
 function Get-ServiceRestorePlan($state,[string[]]$services,[bool]$allowDefaults) {
     # Pure (H-C/A-1). Turn saved state into an explicit per-service action. The contract:
     #   set-raw  - a raw registry original was recorded; restore it byte-for-byte (exact undo)
@@ -222,14 +231,28 @@ function Get-ServiceRestorePlan($state,[string[]]$services,[bool]$allowDefaults)
         $r = Get-PropValue $raw $s
         $f = Get-PropValue $friendly $s
         if ($null -ne $r) {
-            $plan[$s] = @{ Action='set-raw'; Start=[int](Get-PropValue $r 'Start'); DelayedAutostart=(Get-PropValue $r 'DelayedAutostart') }
+            $start = ConvertTo-IntOrNull (Get-PropValue $r 'Start')
+            if ($null -eq $start -or $start -lt 0 -or $start -gt 4) {
+                $plan[$s] = @{ Action='invalid'; Reason=("recorded Start value is not a valid service start type: '{0}'" -f (Get-PropValue $r 'Start')) }
+            } else {
+                $plan[$s] = @{ Action='set-raw'; Start=$start; DelayedAutostart=(Get-PropValue $r 'DelayedAutostart') }
+            }
         }
         elseif ($null -ne $f -and "$f" -ne '') {
-            $plan[$s] = @{ Action='set-mode'; Mode="$f" }
+            # validate now rather than throwing out of Set-SvcStartMode mid-undo (V-3)
+            $ok = $true
+            try { Get-SvcStartValue "$f" | Out-Null } catch { $ok = $false }
+            if ($ok) { $plan[$s] = @{ Action='set-mode'; Mode="$f" } }
+            else     { $plan[$s] = @{ Action='invalid'; Reason=("recorded StartMode is not a recognised start type: '{0}'" -f $f) } }
         }
         elseif ($s -eq 'CDPUserSvc' -and $null -ne (Get-PropValue $state 'cdpUserStart')) {
             # legacy v1.4.0 state.json kept CDPUserSvc's raw Start at the top level
-            $plan[$s] = @{ Action='set-raw'; Start=[int](Get-PropValue $state 'cdpUserStart'); DelayedAutostart='ABSENT' }
+            $legacy = ConvertTo-IntOrNull (Get-PropValue $state 'cdpUserStart')
+            if ($null -eq $legacy -or $legacy -lt 0 -or $legacy -gt 4) {
+                $plan[$s] = @{ Action='invalid'; Reason=("legacy cdpUserStart is not a valid start type: '{0}'" -f (Get-PropValue $state 'cdpUserStart')) }
+            } else {
+                $plan[$s] = @{ Action='set-raw'; Start=$legacy; DelayedAutostart='ABSENT' }
+            }
         }
         elseif ($state) {
             $plan[$s] = @{ Action='skip'; Reason='no original recorded (already disabled before -Apply, or never modified)' }
@@ -251,7 +274,11 @@ function Get-PolicyRestorePlan($policyPrev) {
     foreach ($n in $names) {
         $v = Get-PropValue $policyPrev $n
         if ("$v" -eq 'ABSENT') { $plan[$n] = @{ Action = 'remove' } }
-        else                   { $plan[$n] = @{ Action = 'set'; Value = [int]$v } }
+        else {
+            $iv = ConvertTo-IntOrNull $v
+            if ($null -eq $iv) { $plan[$n] = @{ Action = 'invalid'; Reason = ("recorded policy value is not numeric: '{0}'" -f $v) } }
+            else               { $plan[$n] = @{ Action = 'set'; Value = $iv } }
+        }
     }
     $plan
 }
@@ -372,6 +399,21 @@ function Test-PathOwnerUntrusted([string]$path) {
            catch { $null }
     (-not $sid) -or ($sid -notin $script:TrustedOwnerSids)
 }
+function Set-TrustedOwner([string]$path) {
+    # V-1: OWNERSHIP IS NOT INHERITED. Only ACEs flow down from the parent directory, so a file we
+    # create inside the hardened install dir is owned by whoever created it. Windows has defaulted
+    # "System objects: Default owner for objects created by members of the Administrators group" to
+    # OBJECT CREATOR since XP, which means a file written by elevated admin Alice is owned by
+    # ALICE'S USER SID - not BUILTIN\Administrators. Test-PathOwnerUntrusted would therefore reject
+    # our own freshly written files and abort -Apply on a perfectly normal machine.
+    #
+    # So establish the invariant instead of merely asserting it: vest ownership in Administrators on
+    # every object we create. Legal in both contexts we run in - the creator holds implicit
+    # WRITE_OWNER, and Administrators is in an elevated admin's token as well as SYSTEM's.
+    $acl = Get-Acl -LiteralPath $path
+    $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+    Set-Acl -LiteralPath $path -AclObject $acl
+}
 function Protect-InstallDir {
     # Fail-closed: reject reparse points, create+lock the dir, abort if it stays user-writable.
     if (Test-Path -LiteralPath $InstallDir) {
@@ -392,6 +434,7 @@ function Protect-InstalledScript {
         Remove-Item -LiteralPath $InstalledScript -Force
     }
     Copy-Item -LiteralPath $PSCommandPath -Destination $InstalledScript -Force
+    Set-TrustedOwner $InstalledScript      # V-1: the copy is owned by its creator, not the parent dir
     if (Test-PathUserWritable $InstalledScript)   { throw "SECURITY: installed script is user-writable - refusing to register SYSTEM task." }
     if (Test-PathOwnerUntrusted $InstalledScript) { throw "SECURITY: installed script is owned by a standard user (implicit WRITE_DAC) - refusing to register SYSTEM task." }
 }
@@ -408,12 +451,27 @@ function Remove-OldAuditLog {
 }
 function Start-AuditLog([string]$mode) {
     if ((Test-Path -LiteralPath $LogDir) -and (Test-PathIsReparse $LogDir)) { throw "SECURITY: $LogDir is a reparse point/junction - aborting." }
+    $logDirIsNew = -not (Test-Path -LiteralPath $LogDir)
     Initialize-Dir $LogDir
+    # V-1: Assert-InstallSafe gates on $LogDir too, and a directory we just created is owned by its
+    # creator. Vest it in Administrators so that gate is satisfiable on a normal machine.
+    if ($logDirIsNew) { try { Set-TrustedOwner $LogDir } catch { Write-Verbose $_.Exception.Message } }
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $log = "$LogDir\gdid-$mode-$stamp.log"
-    try { Start-Transcript -Path $log -Force | Out-Null } catch { Write-Verbose $_.Exception.Message }
+    # V-4: record whether WE started it. Start-Transcript fails if the session is already
+    # transcribing, and an unconditional Stop-Transcript in the finally would then tear down the
+    # CALLER's transcript instead of ours.
+    $script:TranscriptStarted = $false
+    try { Start-Transcript -Path $log -Force | Out-Null; $script:TranscriptStarted = $true }
+    catch { Write-Verbose $_.Exception.Message }
     try { Remove-OldAuditLog | Out-Null } catch { Write-Verbose $_.Exception.Message }
     return $log
+}
+function Stop-AuditLog {
+    # V-4: never stop a transcript we did not start.
+    if (-not $script:TranscriptStarted) { return }
+    $script:TranscriptStarted = $false
+    try { Stop-Transcript | Out-Null } catch { Write-Verbose $_.Exception.Message }
 }
 function Write-Ceiling {
     # H-B: the honest ceiling lives at the bottom of the README, where a user who skims does not
@@ -522,6 +580,7 @@ function Read-StateFileSafely {
 function Write-StateFileSafely($obj) {
     if ((Test-Path -LiteralPath $StateFile) -and (Test-PathIsReparse $StateFile)) { throw "SECURITY: $StateFile is a reparse point - aborting." }
     ($obj | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $StateFile -Encoding ASCII
+    Set-TrustedOwner $StateFile             # V-1: a newly written file is owned by its creator
     if (Test-PathUserWritable $StateFile)   { throw "SECURITY: $StateFile is user-writable after write - aborting." }
     if (Test-PathOwnerUntrusted $StateFile) { throw "SECURITY: $StateFile is owned by a standard user after write (implicit WRITE_DAC) - aborting." }
 }
@@ -693,7 +752,7 @@ function Invoke-Apply {
         Write-Host "`nAPPLIED (v$Version). Log: $log" -ForegroundColor Green
         Write-Ceiling      # H-B
         Write-Host "  Verify with: -Verify   Roll back with: -Undo" -ForegroundColor DarkGray
-    } finally { try { Stop-Transcript | Out-Null } catch { Write-Verbose $_.Exception.Message } }
+    } finally { Stop-AuditLog }
     exit 0
 }
 
@@ -725,34 +784,49 @@ function Invoke-Undo {
             Write-Warning "-Force: restoring DOCUMENTED DEFAULTS, not your original configuration."
         }
         $st = $si.State
+        # V-3: build EVERY plan before mutating anything. The plan builders read values straight out
+        # of state.json, and a malformed field used to throw - after Remove-Persistence had already
+        # run - leaving the machine half-reverted. Now a bad field becomes an 'invalid' action that
+        # is reported and skipped, and the plans are computed while the machine is still untouched.
+        $allSvc  = @($AllKillServices) + @($UserKillServices)
+        $plan    = Get-ServiceRestorePlan $st $allSvc ([bool]$Force)
+        $polPrev = if ($st -and (Get-PropValue $st 'policyPrev')) { Get-PropValue $st 'policyPrev' }
+                   elseif ($st -and $null -ne (Get-PropValue $st 'enableCdpPrev')) { @{ EnableCdp = (Get-PropValue $st 'enableCdpPrev') } }   # legacy state.json
+                   else { $null }
+        $pplan   = Get-PolicyRestorePlanOrDefault $polPrev ([bool]$Force)
+        $invalid = @(@($plan.Keys | Where-Object { $plan[$_].Action -eq 'invalid' }) +
+                     @($pplan.Keys | Where-Object { $pplan[$_].Action -eq 'invalid' }))
+        if ($invalid.Count) {
+            Write-Warning ("state.json holds {0} unusable value(s): {1}. Those entries are skipped; everything else is restored normally." -f $invalid.Count,($invalid -join ', '))
+        }
         Write-Host "[E] Removing persistence task" -ForegroundColor Cyan; Remove-Persistence
         Write-Host "[A] Restoring services" -ForegroundColor Cyan
-        $plan = Get-ServiceRestorePlan $st (@($AllKillServices) + @($UserKillServices)) ([bool]$Force)
-        foreach ($s in (@($AllKillServices) + @($UserKillServices))) {
+        foreach ($s in $allSvc) {
             $p = $plan[$s]
             switch ($p.Action) {
                 'set-raw'  { Set-SvcStartRaw $s $p.Start $p.DelayedAutostart; Write-Host ("    {0,-18} -> Start={1}{2}" -f $s,$p.Start,$(if ("$($p.DelayedAutostart)" -ne 'ABSENT') { " DelayedAutostart=$($p.DelayedAutostart)" } else { '' })) }
                 'set-mode' { Set-SvcStartMode $s $p.Mode; Write-Host ("    {0,-18} -> {1} (from legacy state)" -f $s,$p.Mode) }
                 'default'  { Set-SvcStartMode $s $p.Mode; Write-Host ("    {0,-18} -> {1} (DEFAULT, not your original)" -f $s,$p.Mode) -ForegroundColor Yellow }
                 'skip'     { Write-Host ("    {0,-18} -> left as-is ({1})" -f $s,$p.Reason) -ForegroundColor DarkGray }
+                'invalid'  { Write-Warning ("$s -> LEFT AS-IS: $($p.Reason)") }
                 default    { Write-Warning "no restore action for $s ($($p.Reason)) - left as-is." }
             }
         }
         Write-Host "[B] Removing hosts block" -ForegroundColor Cyan;   Remove-HostsBlock
         Write-Host "[C] Removing firewall rules" -ForegroundColor Cyan; Remove-FwBlock
         Write-Host "[D] Restoring policy values" -ForegroundColor Cyan
-        $polPrev = if ($st -and (Get-PropValue $st 'policyPrev')) { Get-PropValue $st 'policyPrev' }
-                   elseif ($st -and $null -ne (Get-PropValue $st 'enableCdpPrev')) { @{ EnableCdp = (Get-PropValue $st 'enableCdpPrev') } }   # legacy state.json
-                   else { $null }
-        $pplan = Get-PolicyRestorePlanOrDefault $polPrev ([bool]$Force)
         if ($pplan.Count -eq 0) { Write-Warning "no saved policy values and no -Force: policy layer left applied." }
         foreach ($n in $pplan.Keys) {
-            if ($pplan[$n].Action -eq 'remove') { Remove-ItemProperty $PolicyKey -Name $n -ErrorAction SilentlyContinue; Write-Host "    $n -> removed" }
-            else { Set-ItemProperty $PolicyKey -Name $n -Value $pplan[$n].Value -Type DWord; Write-Host "    $n -> $($pplan[$n].Value)" }
+            switch ($pplan[$n].Action) {
+                'remove'  { Remove-ItemProperty $PolicyKey -Name $n -ErrorAction SilentlyContinue; Write-Host "    $n -> removed" }
+                'set'     { Set-ItemProperty $PolicyKey -Name $n -Value $pplan[$n].Value -Type DWord; Write-Host "    $n -> $($pplan[$n].Value)" }
+                'invalid' { Write-Warning ("$n -> LEFT AS-IS: $($pplan[$n].Reason)") }
+                default   { Write-Warning "$n -> no restore action; left as-is." }
+            }
         }
         Write-Host "`nREVERTED. Reboot to fully restart CDP/DO. Log: $log" -ForegroundColor Green
         Write-Host "  ($StateFile and the logs are kept on purpose - delete $InstallDir yourself if you want them gone.)" -ForegroundColor DarkGray
-    } finally { try { Stop-Transcript | Out-Null } catch { Write-Verbose $_.Exception.Message } }
+    } finally { Stop-AuditLog }
     exit 0
 }
 
@@ -789,12 +863,20 @@ function Invoke-Verify {
     Write-Host "  -- configuration (deterministic; gates the exit code) --"
     # H-A: iterate the SAME service list -Apply used, not a hardcoded pair.
     foreach ($s in (@($services) + @($UserKillServices))) {
-        $w = Get-CimInstance Win32_Service -Filter "Name='$s'" -ErrorAction SilentlyContinue
-        if ($null -eq $w) { Note ("{0,-18} not present on this build" -f $s); continue }
-        # CDPUserSvc is a per-user service template: its own State is meaningless, the per-session
-        # instances below are what matter, so only its start type gates.
-        $stateOk = ($s -in $UserKillServices) -or ($w.State -eq 'Stopped')
-        Check ($stateOk -and $w.StartMode -eq 'Disabled') ("{0,-18} State={1} Start={2}" -f $s,$w.State,$w.StartMode)
+        # V-2: read the START TYPE from the registry, because that is exactly what -Apply writes
+        # (Set-SvcStartMode). Win32_Service does not reliably surface a per-user service TEMPLATE
+        # such as CDPUserSvc, and the previous code downgraded that case to an advisory Note - so
+        # the one value -Apply wrote for CDPUserSvc was never actually verified. H-A, one spot deep.
+        $raw = Get-SvcRawState $s
+        if ($null -eq $raw) { Note ("{0,-18} not present on this build" -f $s); continue }
+        Check ($raw.Start -eq 4) ("{0,-18} registry Start={1} (want 4 = Disabled)" -f $s,$raw.Start)
+        # State is a genuine runtime property, so it still comes from CIM. A per-user template has
+        # no meaningful State of its own - its per-session instances are checked separately below.
+        if ($s -notin $UserKillServices) {
+            $w = Get-CimInstance Win32_Service -Filter "Name='$s'" -ErrorAction SilentlyContinue
+            if ($w) { Check ($w.State -eq 'Stopped') ("{0,-18} State={1} (want Stopped)" -f $s,$w.State) }
+            else    { Note ("{0,-18} start type verified from the registry; CIM did not surface the service" -f $s) }
+        }
     }
     $cdpuser = Get-Service -Name 'CDPUserSvc_*' -ErrorAction SilentlyContinue | Where-Object Status -eq 'Running'
     Check (-not $cdpuser) ("CDPUserSvc running instances: {0}" -f (@($cdpuser).Count))
@@ -938,7 +1020,7 @@ function Invoke-Test {
         if (-not $installExisted) {
             Write-Host "Left behind on purpose: $InstallDir (hardened) holding this run's audit log." -ForegroundColor DarkGray
         }
-        try { Stop-Transcript | Out-Null } catch { Write-Verbose $_.Exception.Message }
+        Stop-AuditLog
     }
     exit $verdict.Exit
 }

@@ -158,9 +158,14 @@ Assert-Finding 'H-C' ($Readme -match 'exact.{0,80}state file is present|state fi
 
 Section 'M-A  -Test mutates state, so it must leave an audit log'
 Assert-Finding 'M-A' (Test-CommandCall $fnTest 'Start-AuditLog')                                            '-Test opens a transcript'
-Assert-Finding 'M-A' (Test-CommandCall $fnTest 'Stop-Transcript')                                           '-Test closes the transcript'
+Assert-Finding 'M-A' (Test-CommandCall $fnTest 'Stop-AuditLog')                                             '-Test closes the transcript (via the V-4 guarded helper)'
 Assert-Finding 'M-A' ((Get-FirstCallLine $fnTest 'Start-AuditLog') -lt (Get-FirstCallLine $fnTest 'Set-HostsBlock')) 'the transcript starts before the first mutation'
-Assert-Finding 'M-A' ($fnTest.Extent.Text -match 'Stop-Transcript[\s\S]{0,400}$')                     'the transcript stop is in the finally block that always runs'
+# Assert POSITION, not a cmdlet name: the teardown must sit in the finally block, i.e. after the
+# rollback work and at the end of the function. Naming the cmdlet pinned the implementation, so the
+# V-4 refactor to a guarded helper broke a pin whose contract had not actually changed.
+$stopLine  = Get-FirstCallLine $fnTest 'Stop-AuditLog'
+$rollbackL = Get-FirstCallLine $fnTest 'Clear-DnsCache'
+Assert-Finding 'M-A' ($stopLine -gt $rollbackL -and $stopLine -le $fnTest.Extent.EndLineNumber)       'the transcript stop is in the finally block that always runs, after rollback'
 
 Section 'M-B  the check-then-register TOCTOU window'
 $fnInstall = Get-Fn 'Install-Persistence'
@@ -409,6 +414,67 @@ $ciText = Get-DocText '.github/workflows/ci.yml'
 Assert-Finding 'A-13' (@([regex]::Matches($ciText,'if: always\(\)')).Count -ge 2)                     'both CI lanes run the meta-test even when the loop step fails'
 if ($onWindows) { Assert-Finding 'A-10' $true 'running the Windows lane: ACL assertions are live' }
 else            { Write-SkippedFinding 'A-10' 'ACL assertion liveness' 'non-Windows lane; CI Windows job covers it' }
+
+Section 'V-1..V-4  code viability: does it actually run correctly on the target runtime'
+# V-1: the owner invariant must be ESTABLISHED on every object we create, not just asserted.
+# Ownership is not inherited, so without this -Apply throws on a default Windows box.
+Assert-Finding 'V-1' ([bool](Get-Fn 'Set-TrustedOwner'))                                              'a helper vests ownership in Administrators'
+$fnSetOwner = Get-Fn 'Set-TrustedOwner'
+Assert-Finding 'V-1' ($fnSetOwner.Extent.Text -match 'S-1-5-32-544')                                  'it vests ownership in Administrators specifically'
+foreach ($pair in @(@{Fn='Protect-InstalledScript'; What='the installed script'},
+                    @{Fn='Write-StateFileSafely';  What='state.json'},
+                    @{Fn='Start-AuditLog';         What='the log directory'})) {
+    $f = Get-Fn $pair.Fn
+    Assert-Finding 'V-1' (Test-CommandCall $f 'Set-TrustedOwner') ("$($pair.Fn) establishes ownership on $($pair.What) before it is asserted")
+}
+# ordering: ownership is set BEFORE the assertion that would otherwise reject our own file
+$fnPS = Get-Fn 'Protect-InstalledScript'
+Assert-Finding 'V-1' ((Get-FirstCallLine $fnPS 'Set-TrustedOwner') -lt (Get-FirstCallLine $fnPS 'Test-PathOwnerUntrusted')) 'ownership is set before the owner check runs'
+$fnWS = Get-Fn 'Write-StateFileSafely'
+Assert-Finding 'V-1' ((Get-FirstCallLine $fnWS 'Set-TrustedOwner') -lt (Get-FirstCallLine $fnWS 'Test-PathOwnerUntrusted')) 'same ordering for the state file'
+
+# V-2: the start type is verified from the registry (what -Apply writes), not from CIM alone
+Assert-Finding 'V-2' (Test-CommandCall $fnVerify 'Get-SvcRawState')                                   'verify reads the start type from the registry'
+Assert-Finding 'V-2' ($fnVerify.Extent.Text -match 'registry Start=')                                 'the check reports the registry value it compared'
+$cimInVerify = @(Get-CallAst $fnVerify 'Get-CimInstance')
+Assert-Finding 'V-2' ($cimInVerify.Count -ge 1)                                                       'CIM is still used for the genuine runtime State'
+Assert-Finding 'V-2' ($fnVerify.Extent.Text -notmatch '\$stateOk\s*=')                                'the old CIM-only start/state combined check is gone'
+$fnApplyTxt = (Get-Fn 'Invoke-Apply').Extent.Text
+Assert-Finding 'V-2' ($fnApplyTxt -match "Set-SvcStartMode 'CDPUserSvc'")                             'apply still writes the CDPUserSvc start value that verify now checks'
+
+# V-3: nothing read out of state.json may throw, and plans are built before any mutation
+Assert-Finding 'V-3' ([bool](Get-Fn 'ConvertTo-IntOrNull'))                                           'a non-throwing integer conversion exists'
+Assert-Finding 'V-3' ((ConvertTo-IntOrNull '3') -eq 3)                                                'it parses a valid value'
+Assert-Finding 'V-3' ($null -eq (ConvertTo-IntOrNull 'garbage'))                                      'it returns $null instead of throwing on garbage'
+Assert-Finding 'V-3' ($null -eq (ConvertTo-IntOrNull $null))                                          'and on $null'
+$badRaw = @{ servicesRaw = @{ CDPSvc = @{ Start = 'garbage'; DelayedAutostart = 'ABSENT' } } }
+$badPlan = Get-ServiceRestorePlan $badRaw @('CDPSvc') $false
+Assert-Finding 'V-3' ($badPlan['CDPSvc'].Action -eq 'invalid')                                        'a malformed raw Start becomes invalid, not an exception'
+$badMode = Get-ServiceRestorePlan @{ services = @{ DoSvc = 'NotAMode' } } @('DoSvc') $false
+Assert-Finding 'V-3' ($badMode['DoSvc'].Action -eq 'invalid')                                         'a malformed StartMode becomes invalid, not an exception'
+$outOfRange = Get-ServiceRestorePlan @{ servicesRaw = @{ CDPSvc = @{ Start = 99 } } } @('CDPSvc') $false
+Assert-Finding 'V-3' ($outOfRange['CDPSvc'].Action -eq 'invalid')                                     'an out-of-range Start becomes invalid'
+$badPol = Get-PolicyRestorePlan @{ EnableCdp = 'not-a-number' }
+Assert-Finding 'V-3' ($badPol['EnableCdp'].Action -eq 'invalid')                                      'a malformed policy value becomes invalid, not an exception'
+Assert-Finding 'V-3' ((Get-PolicyRestorePlan @{ EnableCdp = '2' })['EnableCdp'].Value -eq 2)          'a numeric string still converts (no regression)'
+# plans must be computed before the first mutation in -Undo
+Assert-Finding 'V-3' ((Get-FirstCallLine $fnUndo 'Get-ServiceRestorePlan') -lt (Get-FirstCallLine $fnUndo 'Remove-Persistence')) 'the service plan is built before anything is removed'
+Assert-Finding 'V-3' ((Get-FirstCallLine $fnUndo 'Get-PolicyRestorePlanOrDefault') -lt (Get-FirstCallLine $fnUndo 'Remove-Persistence')) 'the policy plan is built before anything is removed'
+Assert-Finding 'V-3' ($fnUndo.Extent.Text -match 'unusable value')                                    'undo reports which entries it had to skip'
+
+# V-4: never stop a transcript we did not start
+Assert-Finding 'V-4' ([bool](Get-Fn 'Stop-AuditLog'))                                                 'transcript teardown is centralised'
+$fnStopLog = Get-Fn 'Stop-AuditLog'
+Assert-Finding 'V-4' ($fnStopLog.Extent.Text -match 'TranscriptStarted')                              'it is gated on whether we started one'
+Assert-Finding 'V-4' ((Get-Fn 'Start-AuditLog').Extent.Text -match '\$script:TranscriptStarted = \$true') 'Start-AuditLog records that it started the transcript'
+foreach ($m in 'Invoke-Apply','Invoke-Undo','Invoke-Test') {
+    Assert-Finding 'V-4' (Test-CommandCall (Get-Fn $m) 'Stop-AuditLog') ("$m tears down via the guarded helper")
+}
+$toolStopCalls = @($Ast.FindAll({ param($n) ($n -is [System.Management.Automation.Language.CommandAst]) -and $n.GetCommandName() -eq 'Stop-Transcript' }, $true))
+Assert-Finding 'V-4' ($toolStopCalls.Count -eq 1)                                                     'exactly one Stop-Transcript call remains, inside the guarded helper'
+foreach ($vid in 'V-1','V-2','V-3','V-4') {
+    Assert-Finding $vid ($AuditDoc -match [regex]::Escape($vid)) ("SECURITY-AUDIT.md documents $vid")
+}
 
 Section 'VR-1  install-dir ownership must be asserted, not just the DACL'
 # the trusted-owner set is exactly SYSTEM + Administrators (behavioural, cross-platform)

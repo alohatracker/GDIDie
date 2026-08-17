@@ -18,6 +18,10 @@ them. This document covers the privilege-boundary subset.
 | T-1 | TOCTOU window between `Assert-InstallSafe` and `Register-ScheduledTask` | CWE-367 | Low (local) | **Mitigated** (v1.5.0) |
 | T-2 | `-Test` created `%ProgramData%\SuppressGDID` with inherited (user-writable) ACLs | CWE-377 | Low (local) | **Fixed** (v1.5.0) |
 | P-1 | SYSTEM task invoked `powershell.exe` by bare name (PATH resolution at trigger time) | CWE-426 | Low (hardening) | **Fixed** (v1.5.0, VR pass) |
+| V-1 | The H-2 owner gate asserted an invariant it never established, aborting `-Apply` | CWE-703 | High (functional) | **Fixed** (v1.5.0) |
+| V-2 | `-Verify` never validated the `CDPUserSvc` registry start value `-Apply` writes | CWE-754 | Medium | **Fixed** (v1.5.0) |
+| V-3 | `-Undo` could throw mid-way on malformed `state.json`, half-reverting the machine | CWE-460 | Medium | **Fixed** (v1.5.0) |
+| V-4 | Unconditional `Stop-Transcript` could stop the operator's own transcript | CWE-404 | Low | **Fixed** (v1.5.0) |
 | I-1 | Transcript logs grow unbounded (no rotation) | CWE-400 | Low | **Fixed** (v1.5.0) |
 | I-2 | On-host controls defeatable by the OS vendor (hardcoded IP / DoH) | — | Info | Documented ceiling |
 
@@ -78,9 +82,9 @@ write in the `-Apply`/SYSTEM context).
 
 **Fix (v1.5.0).**
 - `New-HardenedAcl` now calls `SetOwner(BUILTIN\Administrators)`, so `Set-Acl` **re-takes ownership**
-  at apply time (the elevated process holds `SeTakeOwnership`). An elevated admin creates objects
-  owned by `Administrators` and the SYSTEM task creates them owned by `SYSTEM`, so both legitimate
-  writers are trusted owners; anything else means a standard user owns the object.
+  of the directory at apply time (the elevated process holds `SeTakeOwnership`). Note that ownership
+  does **not** propagate to files created inside it — see V-1 below, where that assumption initially
+  broke `-Apply`; `Set-TrustedOwner` establishes it per object instead.
 - `Test-PathOwnerUntrusted` rejects any owner outside `{SYSTEM, Administrators}`, and it is wired into
   **every** fail-closed gate — `Protect-InstallDir`, `Protect-InstalledScript`, `Assert-InstallSafe`,
   `Read-StateFileSafely`, `Write-StateFileSafely`, `Get-StateForUndo` — and into `-Verify` as two new
@@ -100,6 +104,51 @@ PATH resolution when the SYSTEM task triggers. Not directly exploitable — a st
 `System32` or any earlier entry in SYSTEM's PATH — but an unqualified interpreter in a SYSTEM task is a
 hardening gap. Now registered with the absolute
 `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`. Pinned by `VR-2`.
+
+## V-1 — The H-2 owner gate broke `-Apply` on a normal machine  *(fixed, v1.5.0 — viability pass)*
+
+**What.** The H-2 fix asserted that every object backing the SYSTEM task is owned by
+SYSTEM/Administrators. It never *established* that. **Ownership is not inherited** — only ACEs flow
+down from a parent directory — and Windows has defaulted object ownership to the **object creator**
+since XP. So the script copy, `state.json`, and the log directory were all owned by the *elevated
+admin's own user SID*, which is not in `{SYSTEM, Administrators}`. `Test-PathOwnerUntrusted` rejected
+the tool's own freshly created files and `-Apply` aborted with a `SECURITY:` throw.
+
+A security fix that stops the tool from running is not a security fix. This is the class of defect
+an adversarial lens produces and only a viability lens catches: every ACL-writing path requires a
+real elevated Windows session, which CI does not have, so nothing failed.
+
+**Fix.** `Set-TrustedOwner` vests ownership in `BUILTIN\Administrators` on each object the tool
+creates — the installed script after `Copy-Item`, `state.json` after each write, the log directory on
+creation — so the invariant is established before it is asserted. Legal in both execution contexts:
+the creator holds implicit `WRITE_OWNER`, and `Administrators` is present in an elevated admin's token
+and in SYSTEM's. Pinned by `V-1`, including AST ordering checks that ownership is set *before* the
+corresponding assertion runs.
+
+## V-2 — `-Verify` never validated the `CDPUserSvc` start value  *(fixed, v1.5.0)*
+
+`-Apply` writes `CDPUserSvc`'s start type straight to the registry (`Set-SvcStartMode`), but `-Verify`
+read it back through `Get-CimInstance Win32_Service` — which does not reliably surface a **per-user
+service template**. When it didn't, the `$null` branch emitted a non-gating `Note`, so the one value
+`-Apply` wrote for `CDPUserSvc` was never verified: the H-A false-pass class surviving in a single
+spot. The start-type check now reads the registry for **every** service (authoritative, it is exactly
+what `-Apply` writes); CIM is used only for the genuine runtime `State`. Pinned by `V-2`.
+
+## V-3 — `-Undo` could strand a half-reverted machine  *(fixed, v1.5.0)*
+
+Restore plans were built from `state.json` **after** `Remove-Persistence` had already run, and used
+bare `[int]` casts. A hand-edited or corrupt field therefore threw under
+`$ErrorActionPreference = 'Stop'` with the persistence task already gone and nothing else restored.
+`ConvertTo-IntOrNull` replaces the casts, an unusable value becomes an explicit `invalid` action that
+is reported and skipped, and **both** the service and policy plans are now computed while the machine
+is still untouched. Pinned by `V-3`.
+
+## V-4 — `Stop-Transcript` could tear down the operator's own transcript  *(fixed, v1.5.0)*
+
+`Start-Transcript` fails if the session is already transcribing. That failure was swallowed, and the
+`finally` block then called `Stop-Transcript` unconditionally — stopping whatever transcript *was*
+running, i.e. the operator's. `Start-AuditLog` now records whether it started one and `Stop-AuditLog`
+only stops what the tool owns. Pinned by `V-4`.
 
 ## T-1 — Check-then-register TOCTOU window  *(mitigated, v1.5.0)*
 

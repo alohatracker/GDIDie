@@ -205,6 +205,40 @@
         }
 
         # --- deliberate residuals ---------------------------------------------------------------
+        # --- code-viability pass (does it actually run correctly on the target runtime) ---------
+        @{  Id          = 'V-1'
+            Severity    = 'High'
+            Title       = 'The VR-1 owner gate asserted an invariant it never established, so -Apply aborted on a default Windows box'
+            Disposition = 'Fixed'
+            Platform    = 'Any'
+            Fix         = 'Set-TrustedOwner vests ownership in BUILTIN\Administrators on every object the tool creates - the installed script after Copy-Item, state.json after each write, and the log directory on creation - so the owner assertions in Protect-InstalledScript, Write-StateFileSafely and Assert-InstallSafe are satisfiable.'
+            Rationale   = 'Ownership is NOT inherited from the parent directory (only ACEs are), and Windows has defaulted object ownership to the OBJECT CREATOR since XP - so a file written by elevated admin Alice is owned by Alice user SID, not Administrators. Test-PathOwnerUntrusted therefore rejected the tool own freshly created files and threw. A functional regression introduced by the adversarial pass, invisible to CI because every ACL-writing path needs a real elevated Windows session.'
+        }
+        @{  Id          = 'V-2'
+            Severity    = 'Medium'
+            Title       = '-Verify never validated the CDPUserSvc registry Start value that -Apply writes'
+            Disposition = 'Fixed'
+            Platform    = 'Any'
+            Fix         = 'The start-type check now reads the registry through Get-SvcRawState for every service, which is exactly what Set-SvcStartMode writes; CIM is used only for the genuine runtime State property, and a service CIM does not surface no longer silently downgrades to an advisory Note.'
+            Rationale   = 'Win32_Service does not reliably surface a per-user service TEMPLATE like CDPUserSvc. When it did not, the null branch emitted a non-gating Note, so the single value -Apply wrote for CDPUserSvc went unverified - the H-A false-pass class surviving in one spot.'
+        }
+        @{  Id          = 'V-3'
+            Severity    = 'Medium'
+            Title       = '-Undo could throw mid-way on a malformed state.json, leaving the machine half-reverted'
+            Disposition = 'Fixed'
+            Platform    = 'Any'
+            Fix         = 'ConvertTo-IntOrNull replaces bare [int] casts on state-file data; an unusable value becomes an explicit invalid action that is reported and skipped. Invoke-Undo now builds the service AND policy plans before any mutation, so a bad field cannot strand the machine after Remove-Persistence has run.'
+            Rationale   = 'A bare [int] cast on a hand-edited or corrupt field threw under ErrorActionPreference Stop, and the plans were built after the persistence task had already been removed.'
+        }
+        @{  Id          = 'V-4'
+            Severity    = 'Low'
+            Title       = 'An unconditional Stop-Transcript could tear down the caller own transcript'
+            Disposition = 'Fixed'
+            Platform    = 'Any'
+            Fix         = 'Start-AuditLog records whether it actually started the transcript; Stop-AuditLog only stops one the tool started.'
+            Rationale   = 'Start-Transcript fails when the session is already transcribing. That failure was swallowed, then the finally block stopped whatever transcript WAS running - the operator own.'
+        }
+
         # --- VR pass (adversarial LPE audit) ----------------------------------------------------
         @{  Id          = 'VR-1'
             Severity    = 'High'
