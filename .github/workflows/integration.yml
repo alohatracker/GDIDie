@@ -1,0 +1,284 @@
+name: Integration (real -Apply / -Verify / -Undo on Windows)
+
+# The CI lanes in ci.yml never EXECUTE the tool: they cover pure helpers, the AST, and doc drift.
+# Everything that actually touches Windows - service start types, the hosts file, firewall rules,
+# policy keys, install-dir ACLs and ownership, the SYSTEM scheduled task - was unproven until this
+# workflow existed. A GitHub-hosted Windows runner is an elevated, disposable VM, which is exactly
+# the lab machine that validation needs.
+#
+# It mutates the runner on purpose and reverts at the end. Kept in its own workflow so the normal CI
+# gate never depends on it.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ 'claude/**' ]
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: "Environment + elevation (the whole run depends on this)"
+        shell: powershell
+        run: |
+          $p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+          $elevated = $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          Write-Host "PowerShell : $($PSVersionTable.PSVersion)"
+          Write-Host "OS         : $((Get-CimInstance Win32_OperatingSystem).Caption)"
+          Write-Host "Identity   : $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+          Write-Host "Elevated   : $elevated"
+          foreach ($s in 'CDPSvc','DoSvc','CDPUserSvc','DiagTrack','dmwappushservice') {
+            $k = "HKLM:\SYSTEM\CurrentControlSet\Services\$s"
+            if (Test-Path $k) { Write-Host ("  {0,-18} present, Start={1}" -f $s,(Get-ItemProperty $k -Name Start).Start) }
+            else               { Write-Host ("  {0,-18} NOT PRESENT on this image" -f $s) }
+          }
+          if (-not $elevated) { throw "Runner is not elevated - the mutating steps cannot be validated here." }
+          # Snapshot every service start type BEFORE anything runs. Later steps must assert that the
+          # out-of-scope services are UNCHANGED BY US, not that they hold some absolute value: this
+          # image already ships DiagTrack disabled, and asserting "must not be 4" produced a false
+          # failure that looked like an M-C regression. Baseline-and-compare is the real invariant.
+          $baseline = @{}
+          foreach ($s in 'CDPSvc','DoSvc','CDPUserSvc','DiagTrack','dmwappushservice') {
+            $k = "HKLM:\SYSTEM\CurrentControlSet\Services\$s"
+            if (Test-Path $k) { $baseline[$s] = [int](Get-ItemProperty $k -Name Start).Start }
+          }
+          $baseline | ConvertTo-Json | Set-Content -LiteralPath "$env:GITHUB_WORKSPACE\baseline.json" -Encoding ASCII
+          Write-Host "baseline: $($baseline | ConvertTo-Json -Compress)"
+
+      - name: "-Verify before anything (expect failures, must not crash)"
+        shell: powershell
+        run: |
+          .\Suppress-GDID.ps1 -Verify
+          $code = $LASTEXITCODE
+          Write-Host "exit=$code"
+          # 1 = some checks failed, which is correct on a clean machine. 2 = not elevated. Anything
+          # else (or an unhandled throw) is a real defect in the read-only path.
+          if ($code -ne 1 -and $code -ne 0) { throw "-Verify returned $code before apply; expected 0 or 1" }
+          exit 0
+
+      - name: "-Test (reversible live probe, must roll back cleanly)"
+        shell: powershell
+        run: |
+          $hostsBefore = [IO.File]::ReadAllBytes("$env:SystemRoot\System32\drivers\etc\hosts")
+          .\Suppress-GDID.ps1 -Test
+          $code = $LASTEXITCODE
+          Write-Host "exit=$code (0=proved, 1=an endpoint stayed open, 3=inconclusive)"
+          if ($code -notin 0,1,3) { throw "-Test returned unexpected $code" }
+          # A-4/M-2: the byte-exact rollback is the claim under test here.
+          $hostsAfter = [IO.File]::ReadAllBytes("$env:SystemRoot\System32\drivers\etc\hosts")
+          if (Compare-Object $hostsBefore $hostsAfter) { throw "-Test did not restore the hosts file byte-for-byte" }
+          if (Get-NetFirewallRule -DisplayName 'GDID-SUPPRESS*' -ErrorAction SilentlyContinue) { throw "-Test left firewall rules behind" }
+          Write-Host "hosts restored byte-for-byte; no rules left behind"
+          exit 0
+
+      - name: "-Apply (THE step V-1 broke; must exit 0 with no SECURITY: throw)"
+        shell: powershell
+        run: |
+          # *>&1 not 2>&1: the tool reports through Write-Host, which in Windows PowerShell 5.1
+          # goes to the INFORMATION stream. An in-process call captured with 2>&1 therefore yields
+          # an EMPTY string, and every -match against it silently passes - a vacuous assertion.
+          $out = .\Suppress-GDID.ps1 -Apply *>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          Write-Host "exit=$code"
+          if ($out -match 'SECURITY:') { throw "-Apply hit a SECURITY: gate - the V-1 ownership class is still broken" }
+          if ($code -ne 0) { throw "-Apply returned $code, expected 0" }
+          exit 0
+
+      - name: "Inspect what -Apply actually did on disk and in the registry"
+        shell: powershell
+        run: |
+          $dir = "$env:ProgramData\SuppressGDID"
+          $script = "$dir\Suppress-GDID.ps1"
+          $state  = "$dir\state.json"
+          $fail = @()
+
+          # V-1: ownership must be Administrators on every object the tool created (S-1-5-32-544).
+          foreach ($p in @($dir,$script,$state)) {
+            if (-not (Test-Path -LiteralPath $p)) { $fail += "missing: $p"; continue }
+            $owner = (Get-Acl -LiteralPath $p).GetOwner([Security.Principal.SecurityIdentifier]).Value
+            Write-Host ("owner {0,-52} {1}" -f (Split-Path $p -Leaf),$owner)
+            if ($owner -ne 'S-1-5-32-544') { $fail += "owner of $p is $owner, expected S-1-5-32-544 (Administrators)" }
+          }
+
+          # H-1: no write ACE for standard users, and inheritance disabled.
+          Write-Host "`nicacls $dir"; icacls $dir
+          $acl = Get-Acl -LiteralPath $dir
+          if (-not $acl.AreAccessRulesProtected) { $fail += "install dir DACL is not inheritance-protected" }
+          $usersWrite = $acl.Access | Where-Object {
+            $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Value -match '\\Users$|Everyone|Authenticated Users' -and
+            ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]'Write,Delete,ChangePermissions,TakeOwnership') }
+          if ($usersWrite) { $fail += "install dir grants standard users a write-class right" }
+
+          # A-1/V-2: the start types -Apply claims to have written, read back from the registry.
+          foreach ($s in 'CDPSvc','DoSvc','CDPUserSvc') {
+            $k = "HKLM:\SYSTEM\CurrentControlSet\Services\$s"
+            if (-not (Test-Path $k)) { Write-Host "  $s not present on this image (skipped)"; continue }
+            $v = (Get-ItemProperty $k -Name Start).Start
+            Write-Host ("  {0,-18} Start={1}" -f $s,$v)
+            if ($v -ne 4) { $fail += "$s Start=$v, expected 4 (Disabled)" }
+          }
+          # M-C: classic telemetry must be UNCHANGED by a default apply. Compare against the
+          # pre-apply baseline rather than against an assumed value - this image ships DiagTrack
+          # already disabled, and an absolute assertion produced a false M-C regression.
+          $baseline = Get-Content -LiteralPath "$env:GITHUB_WORKSPACE\baseline.json" -Raw | ConvertFrom-Json
+          foreach ($s in 'DiagTrack','dmwappushservice') {
+            $k = "HKLM:\SYSTEM\CurrentControlSet\Services\$s"
+            if (-not (Test-Path $k)) { continue }
+            $v = [int](Get-ItemProperty $k -Name Start).Start
+            $was = $baseline.$s
+            Write-Host ("  {0,-18} Start={1} (out of default scope; was {2})" -f $s,$v,$was)
+            if ($v -ne [int]$was) { $fail += "$s changed from $was to $v under a DEFAULT apply; -IncludeClassicTelemetry should be required for that" }
+          }
+
+          # H-A: all four policy values.
+          $pk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
+          foreach ($n in 'EnableCdp','UploadUserActivities','PublishUserActivities','EnableActivityFeed') {
+            $v = (Get-ItemProperty $pk -Name $n -ErrorAction SilentlyContinue).$n
+            Write-Host ("  policy {0,-24} = {1}" -f $n,$v)
+            if ($v -ne 0) { $fail += "policy $n = $v, expected 0" }
+          }
+
+          # H-A: firewall rules must be enabled, blocking, outbound and service-scoped.
+          foreach ($svc in 'CDPSvc','DoSvc') {
+            $r = @(Get-NetFirewallRule -DisplayName "GDID-SUPPRESS block $svc out" -ErrorAction SilentlyContinue)
+            if ($r.Count -ne 1) { $fail += "expected exactly 1 firewall rule for $svc, found $($r.Count)"; continue }
+            $sf = ($r[0] | Get-NetFirewallServiceFilter).Service
+            Write-Host ("  fw {0,-10} Enabled={1} Action={2} Dir={3} Service={4}" -f $svc,$r[0].Enabled,$r[0].Action,$r[0].Direction,$sf)
+            if ("$($r[0].Enabled)" -ne 'True' -or "$($r[0].Action)" -ne 'Block' -or "$($r[0].Direction)" -ne 'Outbound' -or $sf -ne $svc) {
+              $fail += "firewall rule for $svc has the wrong shape"
+            }
+          }
+
+          # VR-2: the SYSTEM task must use the absolute interpreter path, and carry the scope args.
+          $t = Get-ScheduledTask -TaskName 'GDIDie-Enforce' -ErrorAction SilentlyContinue
+          if (-not $t) { $fail += "GDIDie-Enforce task was not registered" }
+          else {
+            $a = $t.Actions | Select-Object -First 1
+            Write-Host "`ntask execute : $($a.Execute)"
+            Write-Host "task args    : $($a.Arguments)"
+            Write-Host "task runas   : $($t.Principal.UserId)"
+            if ($a.Execute -notmatch 'System32\\WindowsPowerShell\\v1\.0\\powershell\.exe') { $fail += "task interpreter is not the absolute System32 path" }
+            if ($a.Arguments -notmatch '-Apply -NoPersist') { $fail += "task does not re-apply with -Apply -NoPersist" }
+            if ($a.Arguments -match 'IncludeClassicTelemetry') { $fail += "task carries a scope switch that was never requested" }
+          }
+
+          # L-A / M-A: a transcript exists for this apply.
+          $logs = @(Get-ChildItem "$dir\logs" -Filter 'gdid-apply-*.log' -ErrorAction SilentlyContinue)
+          Write-Host "`napply transcripts: $($logs.Count)"
+          if ($logs.Count -lt 1) { $fail += "no apply transcript was written" }
+
+          if ($fail.Count) { $fail | ForEach-Object { Write-Host "FAIL: $_" }; throw "$($fail.Count) post-apply assertion(s) failed" }
+          Write-Host "`nall post-apply assertions passed"
+
+      - name: "-Verify after apply (must be all-pass, exit 0)"
+        shell: powershell
+        run: |
+          $out = .\Suppress-GDID.ps1 -Verify *>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 0) { throw "-Verify returned $code after a successful apply; expected 0 (all pass)" }
+          if ($out -notmatch 'ALL CONFIGURATION CHECKS PASS') { throw "-Verify did not report all-pass" }
+          # H-B: green must not read as anonymity.
+          if ($out -notmatch 'does NOT make you anonymous') { throw "-Verify did not print the honest ceiling on a passing run" }
+          exit 0
+
+      - name: "-Apply again (idempotency + first-write-wins state guard)"
+        shell: powershell
+        run: |
+          $before = Get-Content "$env:ProgramData\SuppressGDID\state.json" -Raw
+          .\Suppress-GDID.ps1 -Apply | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "second -Apply returned $LASTEXITCODE" }
+          $after = Get-Content "$env:ProgramData\SuppressGDID\state.json" -Raw
+          $b = ($before | ConvertFrom-Json).servicesRaw
+          $a = ($after  | ConvertFrom-Json).servicesRaw
+          foreach ($p in $b.psobject.Properties.Name) {
+            if ("$($b.$p.Start)" -ne "$($a.$p.Start)") { throw "re-apply overwrote the saved original for $p ($($b.$p.Start) -> $($a.$p.Start))" }
+          }
+          # a re-apply must not record Disabled as the original
+          foreach ($p in $a.psobject.Properties.Name) {
+            if ("$($a.$p.Start)" -eq '4') { throw "state.json recorded Disabled(4) as the original for $p" }
+          }
+          Write-Host "re-apply preserved every saved original"
+          .\Suppress-GDID.ps1 -Verify | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "-Verify failed after re-apply" }
+          exit 0
+
+      - name: "-Undo (must exit 0 and restore the recorded originals)"
+        shell: powershell
+        run: |
+          $state = Get-Content "$env:ProgramData\SuppressGDID\state.json" -Raw | ConvertFrom-Json
+          $out = .\Suppress-GDID.ps1 -Undo *>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($out -match 'SECURITY:') { throw "-Undo hit a SECURITY: gate" }
+          if ($code -ne 0) { throw "-Undo returned $code, expected 0" }
+          $fail = @()
+          # H-C: every recorded original must be back, exactly.
+          foreach ($p in $state.servicesRaw.psobject.Properties.Name) {
+            $k = "HKLM:\SYSTEM\CurrentControlSet\Services\$p"
+            if (-not (Test-Path $k)) { continue }
+            $now = (Get-ItemProperty $k -Name Start).Start
+            $want = [int]$state.servicesRaw.$p.Start
+            Write-Host ("  {0,-18} Start={1} (recorded original {2})" -f $p,$now,$want)
+            if ($now -ne $want) { $fail += "$p Start=$now, expected the recorded original $want" }
+          }
+          if (Get-NetFirewallRule -DisplayName 'GDID-SUPPRESS*' -ErrorAction SilentlyContinue) { $fail += "firewall rules survived -Undo" }
+          if (Get-ScheduledTask -TaskName 'GDIDie-Enforce' -ErrorAction SilentlyContinue) { $fail += "the SYSTEM task survived -Undo" }
+          $hosts = Get-Content "$env:SystemRoot\System32\drivers\etc\hosts"
+          if ($hosts -match 'GDID-SUPPRESS BEGIN') { $fail += "the hosts block survived -Undo" }
+          # A-8: the policy layer must not be left applied.
+          $pk = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
+          foreach ($n in 'EnableCdp','UploadUserActivities','PublishUserActivities','EnableActivityFeed') {
+            $v = (Get-ItemProperty $pk -Name $n -ErrorAction SilentlyContinue).$n
+            Write-Host ("  policy {0,-24} = {1}" -f $n,$(if ($null -eq $v) { 'absent' } else { $v }))
+            if ($v -eq 0) { $fail += "policy $n is still 0 after -Undo (A-8 regression)" }
+          }
+          if ($fail.Count) { $fail | ForEach-Object { Write-Host "FAIL: $_" }; throw "$($fail.Count) post-undo assertion(s) failed" }
+          Write-Host "`nall post-undo assertions passed"
+
+      - name: "-Undo with no state file (must REFUSE with exit 4, change nothing)"
+        shell: powershell
+        run: |
+          .\Suppress-GDID.ps1 -Apply | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "setup -Apply failed" }
+          Remove-Item "$env:ProgramData\SuppressGDID\state.json" -Force
+          $before = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\CDPSvc' -Name Start).Start
+          $out = .\Suppress-GDID.ps1 -Undo *>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          # H-C: refuse rather than guess, and refuse BEFORE changing anything.
+          if ($code -ne 4) { throw "-Undo without state returned $code, expected 4 (refused)" }
+          if ($out -notmatch 'REFUSING to undo') { throw "-Undo did not print the refusal" }
+          $after = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\CDPSvc' -Name Start).Start
+          if ($before -ne $after) { throw "the refusal still changed CDPSvc Start ($before -> $after) - it must change nothing" }
+          if (-not (Get-ScheduledTask -TaskName 'GDIDie-Enforce' -ErrorAction SilentlyContinue)) { throw "the refusal removed the SYSTEM task - it must change nothing" }
+          Write-Host "refused cleanly and changed nothing"
+          exit 0
+
+      - name: "-Undo -Force (documented defaults) then confirm reverted"
+        shell: powershell
+        run: |
+          $out = .\Suppress-GDID.ps1 -Undo -Force *>&1 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) { throw "-Undo -Force returned $LASTEXITCODE" }
+          if ($out -notmatch 'DEFAULT') { throw "-Undo -Force did not flag that it used defaults, not originals" }
+          .\Suppress-GDID.ps1 -Verify | Out-Null
+          $code = $LASTEXITCODE
+          Write-Host "post-undo -Verify exit=$code (expect 1: nothing is applied any more)"
+          if ($code -eq 0) { throw "-Verify still reports all-pass after -Undo" }
+          exit 0
+
+      - name: "Cleanup (best effort; the runner is discarded anyway)"
+        if: always()
+        shell: powershell
+        run: |
+          try { .\Suppress-GDID.ps1 -Undo -Force | Out-Null } catch { Write-Host "cleanup undo: $($_.Exception.Message)" }
+          Get-NetFirewallRule -DisplayName 'GDID-SUPPRESS*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          Get-ScheduledTask -TaskName 'GDIDie-Enforce' -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false
+          exit 0
