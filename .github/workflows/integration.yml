@@ -38,6 +38,17 @@ jobs:
             else               { Write-Host ("  {0,-18} NOT PRESENT on this image" -f $s) }
           }
           if (-not $elevated) { throw "Runner is not elevated - the mutating steps cannot be validated here." }
+          # Snapshot every service start type BEFORE anything runs. Later steps must assert that the
+          # out-of-scope services are UNCHANGED BY US, not that they hold some absolute value: this
+          # image already ships DiagTrack disabled, and asserting "must not be 4" produced a false
+          # failure that looked like an M-C regression. Baseline-and-compare is the real invariant.
+          $baseline = @{}
+          foreach ($s in 'CDPSvc','DoSvc','CDPUserSvc','DiagTrack','dmwappushservice') {
+            $k = "HKLM:\SYSTEM\CurrentControlSet\Services\$s"
+            if (Test-Path $k) { $baseline[$s] = [int](Get-ItemProperty $k -Name Start).Start }
+          }
+          $baseline | ConvertTo-Json | Set-Content -LiteralPath "$env:GITHUB_WORKSPACE\baseline.json" -Encoding ASCII
+          Write-Host "baseline: $($baseline | ConvertTo-Json -Compress)"
 
       - name: "-Verify before anything (expect failures, must not crash)"
         shell: powershell
@@ -109,13 +120,17 @@ jobs:
             Write-Host ("  {0,-18} Start={1}" -f $s,$v)
             if ($v -ne 4) { $fail += "$s Start=$v, expected 4 (Disabled)" }
           }
-          # M-C: classic telemetry must be untouched by a default apply.
+          # M-C: classic telemetry must be UNCHANGED by a default apply. Compare against the
+          # pre-apply baseline rather than against an assumed value - this image ships DiagTrack
+          # already disabled, and an absolute assertion produced a false M-C regression.
+          $baseline = Get-Content -LiteralPath "$env:GITHUB_WORKSPACE\baseline.json" -Raw | ConvertFrom-Json
           foreach ($s in 'DiagTrack','dmwappushservice') {
             $k = "HKLM:\SYSTEM\CurrentControlSet\Services\$s"
             if (-not (Test-Path $k)) { continue }
-            $v = (Get-ItemProperty $k -Name Start).Start
-            Write-Host ("  {0,-18} Start={1} (out of default scope)" -f $s,$v)
-            if ($v -eq 4) { $fail += "$s was disabled by a DEFAULT apply; -IncludeClassicTelemetry should be required" }
+            $v = [int](Get-ItemProperty $k -Name Start).Start
+            $was = $baseline.$s
+            Write-Host ("  {0,-18} Start={1} (out of default scope; was {2})" -f $s,$v,$was)
+            if ($v -ne [int]$was) { $fail += "$s changed from $was to $v under a DEFAULT apply; -IncludeClassicTelemetry should be required for that" }
           }
 
           # H-A: all four policy values.
