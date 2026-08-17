@@ -1,0 +1,17 @@
+# L-C: the CI pins actions by SHA and PSScriptAnalyzer by exact version, which is the right call
+# for a security tool - but a pin with no bump mechanism silently ages. Dependabot opens the PRs;
+# the pinning stays.
+#
+# PSScriptAnalyzer is a PSGallery module, which Dependabot does not cover. Its pin is bumped by
+# hand; the weekly scheduled CI run in ci.yml is what surfaces the need.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"

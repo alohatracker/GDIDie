@@ -6,42 +6,64 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+  schedule:
+    # L-C: the action SHAs and the PSScriptAnalyzer version are pinned on purpose. A weekly run
+    # surfaces bit-rot (a yanked module version, a deprecated runner image) on a cadence instead of
+    # at whatever moment someone next pushes.
+    - cron: '17 6 * * 1'
 
 permissions:
   contents: read
 
 jobs:
-  verify:
+  # Primary lane: Windows PowerShell 5.1, the version the tool actually targets. -FailOnSkip makes
+  # a platform-skipped assertion a build failure here, so the ACL/SID checks can never silently
+  # stop running on the one platform that can run them.
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Static analysis (PSScriptAnalyzer)
+      - name: Install PSScriptAnalyzer (pinned)
         shell: powershell
         run: |
           Set-PSRepository PSGallery -InstallationPolicy Trusted
           Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -RequiredVersion 1.25.0
-          $findings = Invoke-ScriptAnalyzer -Path . -Recurse -Settings .\PSScriptAnalyzerSettings.psd1
-          $findings | Format-Table -AutoSize
-          if ($findings) { throw "PSScriptAnalyzer reported $($findings.Count) finding(s)" }
-          Write-Host "Static analysis clean." -ForegroundColor Green
 
-      - name: Unit tests
+      - name: Audit loop (parse + analyzer + unit + smoke + findings + coverage gate)
         shell: powershell
         run: |
-          .\Tests\Run-Tests.ps1
-          if ($LASTEXITCODE -ne 0) { throw "Unit tests failed ($LASTEXITCODE)" }
+          .\Tests\Invoke-AuditLoop.ps1 -FailOnSkip -ReportPath audit-report.json
+          if ($LASTEXITCODE -ne 0) { throw "Audit loop failed ($LASTEXITCODE)" }
 
-      - name: Smoke test (install-dir hardening on a real dir)
+      - name: Meta-test (the loop must reject injected regressions)
         shell: powershell
         run: |
-          .\Tests\Smoke-Test.ps1
-          if ($LASTEXITCODE -ne 0) { throw "Smoke test failed ($LASTEXITCODE)" }
+          .\Tests\Test-AuditLoop.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Audit-loop meta-test failed ($LASTEXITCODE)" }
 
-      - name: Parse check
+      - name: Audit report
+        if: always()
         shell: powershell
         run: |
-          $errors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path .\Suppress-GDID.ps1), [ref]$null, [ref]$errors) | Out-Null
-          if ($errors) { $errors | ForEach-Object { Write-Host $_.Message }; throw "Parse errors" }
-          Write-Host "Parse OK." -ForegroundColor Green
+          if (Test-Path audit-report.json) { Get-Content audit-report.json -Raw | Write-Host }
+
+  # Secondary lane: PowerShell 7 on Linux. It cannot exercise the ACL/service/firewall surface, so
+  # those assertions SKIP rather than fail - but it does run every pure helper, every AST structural
+  # check, and the blocklist drift checks, which is where regressions are cheapest to catch.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Audit loop (cross-platform subset)
+        shell: pwsh
+        run: |
+          ./Tests/Invoke-AuditLoop.ps1 -SkipAnalyzer
+          if ($LASTEXITCODE -ne 0) { throw "Audit loop failed ($LASTEXITCODE)" }
+
+      - name: Meta-test (the loop must reject injected regressions)
+        shell: pwsh
+        run: |
+          ./Tests/Test-AuditLoop.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Audit-loop meta-test failed ($LASTEXITCODE)" }
