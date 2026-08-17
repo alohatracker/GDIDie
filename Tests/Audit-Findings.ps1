@@ -476,6 +476,27 @@ foreach ($vid in 'V-1','V-2','V-3','V-4') {
     Assert-Finding $vid ($AuditDoc -match [regex]::Escape($vid)) ("SECURITY-AUDIT.md documents $vid")
 }
 
+Section 'V-6  a text assertion on captured tool output must not be vacuous'
+$integTxt = Get-DocText '.github/workflows/integration.yml'
+$vacuous = @()
+$iLines = @($integTxt -split "`r?`n")
+for ($i = 0; $i -lt $iLines.Count; $i++) {
+    if ($iLines[$i] -match '\.\\Suppress-GDID\.ps1[^|]*2>&1\s*\|') { $vacuous += ($i + 1) }
+}
+Assert-Finding 'V-6' ($vacuous.Count -eq 0) ("no tool-output capture uses 2>&1{0}" -f $(if ($vacuous.Count) { " (lines $($vacuous -join ', '))" } else { '' }))
+Assert-Finding 'V-6' ($integTxt -match '\*>&1 \| Out-String')                                          'captures merge every stream, so Write-Host output is present'
+Assert-Finding 'V-6' ($integTxt -match 'INFORMATION stream')                                          'the reason is recorded next to the code'
+Assert-Finding 'V-6' ($loopText -match 'the match is vacuous')                                        'the loop lints for the 2>&1 capture class'
+# behavioural: this is the mechanism, asserted rather than assumed
+$probe = Join-Path ([IO.Path]::GetTempPath()) ("gdidie-stream-" + [Guid]::NewGuid().ToString('N').Substring(0,8) + '.ps1')
+Set-Content -LiteralPath $probe -Value 'Write-Host "HOSTLINE"' -Encoding ASCII
+try {
+    $with2 = & $probe 2>&1 | Out-String
+    $withAll = & $probe *>&1 | Out-String
+    Assert-Finding 'V-6' ($with2 -notmatch 'HOSTLINE')                                                 'confirmed: 2>&1 does NOT capture Write-Host from an in-process call'
+    Assert-Finding 'V-6' ($withAll -match 'HOSTLINE')                                                  'confirmed: *>&1 does capture it'
+} finally { Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue }
+
 Section 'V-5  a workflow that YAML rejects must not be able to masquerade as a pass'
 $wfFiles = @(Get-ChildItem -LiteralPath (Join-Path $Repo '.github/workflows') -Filter '*.yml' -File -ErrorAction SilentlyContinue)
 Assert-Finding 'V-5' ($wfFiles.Count -ge 2)                                                           'the workflow directory holds the CI and integration lanes'

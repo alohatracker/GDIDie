@@ -79,7 +79,10 @@ jobs:
       - name: "-Apply (THE step V-1 broke; must exit 0 with no SECURITY: throw)"
         shell: powershell
         run: |
-          $out = .\Suppress-GDID.ps1 -Apply 2>&1 | Out-String
+          # *>&1 not 2>&1: the tool reports through Write-Host, which in Windows PowerShell 5.1
+          # goes to the INFORMATION stream. An in-process call captured with 2>&1 therefore yields
+          # an EMPTY string, and every -match against it silently passes - a vacuous assertion.
+          $out = .\Suppress-GDID.ps1 -Apply *>&1 | Out-String
           $code = $LASTEXITCODE
           Write-Host $out
           Write-Host "exit=$code"
@@ -176,7 +179,7 @@ jobs:
       - name: "-Verify after apply (must be all-pass, exit 0)"
         shell: powershell
         run: |
-          $out = .\Suppress-GDID.ps1 -Verify 2>&1 | Out-String
+          $out = .\Suppress-GDID.ps1 -Verify *>&1 | Out-String
           $code = $LASTEXITCODE
           Write-Host $out
           if ($code -ne 0) { throw "-Verify returned $code after a successful apply; expected 0 (all pass)" }
@@ -210,7 +213,7 @@ jobs:
         shell: powershell
         run: |
           $state = Get-Content "$env:ProgramData\SuppressGDID\state.json" -Raw | ConvertFrom-Json
-          $out = .\Suppress-GDID.ps1 -Undo 2>&1 | Out-String
+          $out = .\Suppress-GDID.ps1 -Undo *>&1 | Out-String
           $code = $LASTEXITCODE
           Write-Host $out
           if ($out -match 'SECURITY:') { throw "-Undo hit a SECURITY: gate" }
@@ -246,7 +249,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "setup -Apply failed" }
           Remove-Item "$env:ProgramData\SuppressGDID\state.json" -Force
           $before = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\CDPSvc' -Name Start).Start
-          $out = .\Suppress-GDID.ps1 -Undo 2>&1 | Out-String
+          $out = .\Suppress-GDID.ps1 -Undo *>&1 | Out-String
           $code = $LASTEXITCODE
           Write-Host $out
           # H-C: refuse rather than guess, and refuse BEFORE changing anything.
@@ -261,7 +264,7 @@ jobs:
       - name: "-Undo -Force (documented defaults) then confirm reverted"
         shell: powershell
         run: |
-          $out = .\Suppress-GDID.ps1 -Undo -Force 2>&1 | Out-String
+          $out = .\Suppress-GDID.ps1 -Undo -Force *>&1 | Out-String
           Write-Host $out
           if ($LASTEXITCODE -ne 0) { throw "-Undo -Force returned $LASTEXITCODE" }
           if ($out -notmatch 'DEFAULT') { throw "-Undo -Force did not flag that it used defaults, not originals" }

@@ -114,6 +114,13 @@ if (& $want 'parse') {
                 }
             }
         }
+        # V-6: capturing an in-process call with 2>&1 misses Write-Host (information stream in 5.1),
+        # so any later -match on the captured text is vacuous and can never fail.
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '\.\\Suppress-GDID\.ps1[^|]*2>&1\s*\|') {
+                $bad += ("{0}:{1} captures tool output with 2>&1; use *>&1 or the match is vacuous (Write-Host is the information stream)" -f $wf.Name,($i+1))
+            }
+        }
         $text = ($lines -join "`n")
         if ($text -notmatch '(?m)^jobs:') { $bad += ("{0} has no jobs: block" -f $wf.Name) }
         if ($text -notmatch '(?m)^on:')   { $bad += ("{0} has no on: trigger block" -f $wf.Name) }

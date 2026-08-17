@@ -248,6 +248,15 @@
             Rationale   = 'The integration workflow was rejected at startup because a step name contained "no SECURITY: throw". The run reported failure with ZERO jobs, produced no check run, and would have been trivially mistaken for not-applicable. Same shape as H-A: a check that never ran, presenting as fine.'
         }
 
+        @{  Id          = 'V-6'
+            Severity    = 'Medium'
+            Title       = 'Integration assertions captured tool output with 2>&1, which misses Write-Host, making every text match vacuous'
+            Disposition = 'Fixed'
+            Platform    = 'Any'
+            Fix         = 'The integration workflow captures with *>&1 so the information stream is included, and the audit loop lints the workflows for a 2>&1 capture whose result is later matched.'
+            Rationale   = 'The tool reports through Write-Host, which in Windows PowerShell 5.1 writes to the INFORMATION stream; an in-process call captured with 2>&1 yields an empty string. So the -Apply check for a SECURITY: throw could never fail, and the post-apply -Verify check threw even though the log plainly showed ALL CONFIGURATION CHECKS PASS. A false PASS inside the validation lane - the H-A class, one level up.'
+        }
+
         # --- VR pass (adversarial LPE audit) ----------------------------------------------------
         @{  Id          = 'VR-1'
             Severity    = 'High'
