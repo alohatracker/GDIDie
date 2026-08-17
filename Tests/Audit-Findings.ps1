@@ -358,7 +358,9 @@ Assert-Finding 'A-10' ($metaText -match 'control: an unmodified copy passes')   
 # Windows lane exists - so they are pinned rather than just fixed.
 $psFiles = @(Get-ChildItem -LiteralPath $Repo -Recurse -Filter '*.ps1' -File | Where-Object { $_.FullName -notmatch '\.git' })
 $threeArgJoin = @($psFiles | Where-Object {
-    @(Get-Content -LiteralPath $_.FullName | Where-Object { $_ -match "Join-Path\s+[^\s(|;]+\s+'[^']*'\s+'[^']*'" }).Count -gt 0
+    @(Get-Content -LiteralPath $_.FullName |
+      Where-Object { $_ -notmatch '^\s*#' } |
+      Where-Object { $_ -match "Join-Path\s+[^\s(|;]+\s+'[^']*'\s+'[^']*'" }).Count -gt 0
 } | ForEach-Object { $_.Name })
 Assert-Finding 'A-12' ($threeArgJoin.Count -eq 0) ("no 3-segment Join-Path (-AdditionalChildPath is PowerShell 6+, absent in the 5.1 target){0}" -f $(if ($threeArgJoin.Count) { ": $($threeArgJoin -join ', ')" } else { '' }))
 $shadowed = @()
@@ -377,6 +379,26 @@ Assert-Finding 'A-12' ([bool](Get-Fn 'Clear-DnsCache'))                         
 $loopChild = Get-DocText 'Tests/Invoke-AuditLoop.ps1'
 Assert-Finding 'A-12' ($loopChild -match "ErrorActionPreference = 'Continue'")                        'child stderr produces a FAIL stage instead of aborting the loop mid-run'
 Assert-Finding 'A-12' ($loopChild -match 'Get-ChildFailureLine')                                      'a crashing child is diagnosable from one run'
+
+# A-13: the coverage gate's per-finding attribution must survive the 5.1/6+ ConvertFrom-Json split.
+# AST, not regex: a textual scan also matches the comment that EXPLAINS the bug (it did, on the
+# first run of this pin). @(...) is an ArrayExpressionAst, so ask the parser instead.
+$pipelineWrap = @()
+foreach ($f in $psFiles) {
+    $fa = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+    $wrapped = @($fa.FindAll({ param($n)
+        ($n -is [System.Management.Automation.Language.ArrayExpressionAst]) -and
+        [bool]$n.Find({ param($m) ($m -is [System.Management.Automation.Language.CommandAst]) -and $m.GetCommandName() -eq 'ConvertFrom-Json' }, $true)
+    }, $true))
+    if ($wrapped.Count) { $pipelineWrap += $f.Name }
+}
+Assert-Finding 'A-13' ($pipelineWrap.Count -eq 0) ("no @() wrapped directly around a ConvertFrom-Json pipeline (5.1 emits an array as one object){0}" -f $(if ($pipelineWrap.Count) { ": $($pipelineWrap -join ', ')" } else { '' }))
+Assert-Finding 'A-13' ($loopChild -match '\$parsed = Get-Content[^\r\n]*ConvertFrom-Json')                    'the report is assigned before being wrapped, which is flat on both runtimes'
+Assert-Finding 'A-13' ($loopChild -notmatch 'Select-Object -ExpandProperty Id')                        'the orphan check cannot hard-error on an unexpected row shape'
+Assert-Finding 'A-13' ($metaText -match 'fails only its own finding')                                 'a meta-test case pins per-finding attribution'
+Assert-Finding 'A-13' ($metaText -match 'WantRegex')                                                  'that case asserts the shape of the coverage table, not just a phrase'
+$ciText = Get-DocText '.github/workflows/ci.yml'
+Assert-Finding 'A-13' (@([regex]::Matches($ciText,'if: always\(\)')).Count -ge 2)                     'both CI lanes run the meta-test even when the loop step fails'
 if ($onWindows) { Assert-Finding 'A-10' $true 'running the Windows lane: ACL assertions are live' }
 else            { Write-SkippedFinding 'A-10' 'ACL assertion liveness' 'non-Windows lane; CI Windows job covers it' }
 

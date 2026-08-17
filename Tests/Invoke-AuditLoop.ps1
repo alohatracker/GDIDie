@@ -151,7 +151,15 @@ if (& $want 'findings') {
         } else {
             Add-Stage 'findings' 'PASS' $summary
         }
-        if (Test-Path -LiteralPath $tmp) { $findingRows = @(Get-Content -LiteralPath $tmp -Raw | ConvertFrom-Json) }
+        # A-13: Windows PowerShell 5.1 emits a parsed JSON array as ONE pipeline object; 6+
+        # enumerates it. So `@(... | ConvertFrom-Json)` collapses 155 assertion rows into a single
+        # nested row on 5.1, which destroys per-finding attribution: every finding then reports one
+        # assertion, and a single failure anywhere marks them all FAIL. Assign first, THEN wrap -
+        # correct under both, because @() on a variable that already holds an array stays flat.
+        if (Test-Path -LiteralPath $tmp) {
+            $parsed = Get-Content -LiteralPath $tmp -Raw | ConvertFrom-Json
+            $findingRows = @($parsed)
+        }
         else { Add-Stage 'findings' 'FAIL' 'no findings report was produced'; Write-ChildOutput @($r.Output | Select-Object -Last 15) }
     } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 }
@@ -188,7 +196,10 @@ if (& $want 'coverage') {
     $covSkip = @($rows | Where-Object Status -eq 'SKIP')
     # Orphan check: an assertion for an Id nobody registered. Audit-Findings throws on this, so
     # reaching here means the registry was edited after the fact.
-    $orphans = @($findingRows | Where-Object { $registry.Findings.Id -notcontains $_.Id } | Select-Object -ExpandProperty Id -Unique)
+    # ForEach-Object rather than Select-Object -ExpandProperty: the latter throws outright if a row
+    # is not shaped as expected, turning a reportable gate failure into a crashed run.
+    $orphans = @($findingRows | Where-Object { $_.Id -and ($registry.Findings.Id -notcontains $_.Id) } |
+                 ForEach-Object { $_.Id } | Sort-Object -Unique)
     if ($orphans.Count) { Add-Stage 'coverage' 'FAIL' ("assertions cite unregistered finding(s): {0}" -f ($orphans -join ', ')) }
     if ($covFail.Count) {
         foreach ($r in $covFail) { Write-Host ("    ! {0}: {1} - {2}" -f $r.Id,$r.Note,$r.Title) -ForegroundColor Red }

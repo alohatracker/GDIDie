@@ -75,6 +75,14 @@ $cases = @(
        WantExit= 1
        WantText= 'I-2' }
 
+    # A-13: per-finding attribution. One broken pin must fail exactly ITS finding and leave the
+    # others passing. The PowerShell 5.1 ConvertFrom-Json array-collapse bug made every finding
+    # report FAIL off a single failure anywhere, which this case detects and the cases above do not.
+    @{ Name    = 'one failing assertion fails only its own finding, not every finding'
+       Mutate  = { param($c) Edit-File $c 'Tests/Audit-Findings.ps1' "Assert-Finding 'M-A' (Test-CommandCall `$fnTest 'Start-AuditLog')" "Assert-Finding 'M-A' (`$false -and (Test-CommandCall `$fnTest 'Start-AuditLog'))" }
+       WantExit= 1
+       WantRegex= '(?s)M-A\s+Medium\s+Fixed\s+\d+\s+FAIL.*?H-A\s+High\s+Fixed\s+\d+\s+PASS|(?s)H-A\s+High\s+Fixed\s+\d+\s+PASS.*?M-A\s+Medium\s+Fixed\s+\d+\s+FAIL' }
+
     @{ Name    = 'an assertion citing an unregistered finding id is a hard error'
        Mutate  = { param($c) Edit-File $c 'Tests/Audit-Findings.ps1' "Assert-Finding 'H-A' ((@(Get-KillServiceList" "Assert-Finding 'H-Q' ((@(Get-KillServiceList" }
        WantExit= 1
@@ -88,10 +96,13 @@ foreach ($case in $cases) {
         & $case.Mutate $copy
         $r = Invoke-LoopIn $copy
         $exitOk = ($r.Code -eq $case.WantExit)
-        $textOk = ($r.Text -match [regex]::Escape($case.WantText))
+        # WantText is a literal substring; WantRegex is a pattern (used where the shape of the
+        # coverage table itself is what must be asserted, not just a phrase).
+        $expect = if ($case.WantRegex) { $case.WantRegex } else { [regex]::Escape($case.WantText) }
+        $textOk = ($r.Text -match $expect)
         Assert ($exitOk -and $textOk) ("{0} (exit {1}, wanted {2})" -f $case.Name,$r.Code,$case.WantExit)
         if (-not ($exitOk -and $textOk)) {
-            Write-Host ("    expected text /{0}/ in output; tail follows:" -f $case.WantText) -ForegroundColor DarkGray
+            Write-Host ("    expected match /{0}/ in output; tail follows:" -f $expect) -ForegroundColor DarkGray
             @($r.Text -split "`n" | Select-Object -Last 12) | ForEach-Object { Write-Host "    | $_" -ForegroundColor DarkGray }
         }
     } finally { Remove-Item -LiteralPath $copy -Recurse -Force -ErrorAction SilentlyContinue }

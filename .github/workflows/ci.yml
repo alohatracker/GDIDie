@@ -36,7 +36,12 @@ jobs:
           .\Tests\Invoke-AuditLoop.ps1 -FailOnSkip -ReportPath audit-report.json
           if ($LASTEXITCODE -ne 0) { throw "Audit loop failed ($LASTEXITCODE)" }
 
+      # if: always() on purpose. The meta-test checks whether the GATE works; running it only when
+      # the gate is already green means a broken gate hides its own meta-test. That is exactly how
+      # A-13 slipped through: the loop step failed, this step was skipped, and the coverage table's
+      # collapsed attribution went unexamined for a run.
       - name: Meta-test (the loop must reject injected regressions)
+        if: always()
         shell: powershell
         run: |
           .\Tests\Test-AuditLoop.ps1
@@ -63,6 +68,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Audit loop failed ($LASTEXITCODE)" }
 
       - name: Meta-test (the loop must reject injected regressions)
+        if: always()
         shell: pwsh
         run: |
           ./Tests/Test-AuditLoop.ps1

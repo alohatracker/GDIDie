@@ -195,6 +195,15 @@
             Rationale   = 'Found by the Windows CI lane on the first run while the Linux lane was green - exactly the split the two lanes exist for. Pinned so a PowerShell-7-only idiom cannot creep back into a 5.1 tool.'
         }
 
+        @{  Id          = 'A-13'
+            Severity    = 'High'
+            Title       = 'The coverage gate lost per-finding attribution on Windows PowerShell 5.1 (ConvertFrom-Json array collapse)'
+            Disposition = 'Fixed'
+            Platform    = 'Any'
+            Fix         = 'The findings report is assigned before being wrapped in @(), so the parsed array stays flat on both runtimes; the orphan check uses ForEach-Object instead of Select-Object -ExpandProperty so a malformed row reports instead of crashing; and the meta-test gained an attribution case that fails one pin and requires the other findings to stay PASS.'
+            Rationale   = '5.1 emits a parsed JSON array as one pipeline object while 6+ enumerates it, so @(pipeline) collapsed 155 assertion rows into one. Effect was over-reporting, not a false all-clear: a missing pin still showed 0 assertions, but any single failure marked every finding FAIL and the Asserts column read 1 everywhere. Registered High because the gate is the control the whole harness rests on.'
+        }
+
         # --- deliberate residuals ---------------------------------------------------------------
         @{  Id          = 'I-2'
             Severity    = 'Info'
