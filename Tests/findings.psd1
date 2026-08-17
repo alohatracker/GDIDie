@@ -205,6 +205,24 @@
         }
 
         # --- deliberate residuals ---------------------------------------------------------------
+        # --- VR pass (adversarial LPE audit) ----------------------------------------------------
+        @{  Id          = 'VR-1'
+            Severity    = 'High'
+            Title       = 'Install-dir ownership never asserted: a pre-created attacker-owned directory keeps implicit WRITE_DAC and can hijack the SYSTEM task (LPE)'
+            Disposition = 'Fixed'
+            Platform    = 'Any'
+            Fix         = 'New-HardenedAcl now SetOwner(BUILTIN\Administrators) so Set-Acl re-takes ownership at apply time; Test-PathOwnerUntrusted rejects any owner outside {SYSTEM, Administrators}; every fail-closed gate (Protect-InstallDir, Protect-InstalledScript, Assert-InstallSafe, Read-StateFileSafely, Write-StateFileSafely, Get-StateForUndo) and -Verify now checks owner, not just the DACL.'
+            Rationale   = 'A DACL does not bind the object owner - the owner keeps implicit READ_CONTROL+WRITE_DAC with no OWNER RIGHTS (S-1-3-4) ACE to strip it. %ProgramData% lets a standard user pre-create the subdir as CREATOR OWNER; the prior code re-wrote the DACL but left them owner, so they could re-open the DACL later and replace the script the GDIDie-Enforce SYSTEM task executes. Test-PathUserWritable is DACL-only and cannot see implicit owner rights.'
+        }
+        @{  Id          = 'VR-2'
+            Severity    = 'Low'
+            Title       = 'SYSTEM scheduled task invoked powershell.exe by bare name, leaning on PATH resolution at trigger time'
+            Disposition = 'Fixed'
+            Platform    = 'Any'
+            Fix         = 'Install-Persistence registers the task with the absolute %SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe, removing any executable search.'
+            Rationale   = 'Defense-in-depth. A standard user cannot write System32 or earlier SYSTEM PATH entries, so this was not directly exploitable, but an unqualified interpreter in a SYSTEM task is a hardening gap an LPE reviewer expects closed.'
+        }
+
         @{  Id          = 'I-2'
             Severity    = 'Info'
             Title       = 'On-host controls are defeatable by a sufficiently privileged OS-vendor component (hardcoded IPs, DoH)'

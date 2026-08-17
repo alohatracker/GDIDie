@@ -14,8 +14,10 @@ them. This document covers the privilege-boundary subset.
 | # | Finding | CWE | Severity | Status |
 |---|---------|-----|----------|--------|
 | H-1 | Install dir writable by standard users while a **SYSTEM** task executes from it | CWE-377 / CWE-427 | High (local) | **Fixed** (v1.2.0) |
+| H-2 | Install-dir **ownership** never asserted: a pre-created attacker-owned dir keeps implicit `WRITE_DAC` and can hijack the SYSTEM task | CWE-282 / CWE-427 | High (local) | **Fixed** (v1.5.0, VR pass) |
 | T-1 | TOCTOU window between `Assert-InstallSafe` and `Register-ScheduledTask` | CWE-367 | Low (local) | **Mitigated** (v1.5.0) |
 | T-2 | `-Test` created `%ProgramData%\SuppressGDID` with inherited (user-writable) ACLs | CWE-377 | Low (local) | **Fixed** (v1.5.0) |
+| P-1 | SYSTEM task invoked `powershell.exe` by bare name (PATH resolution at trigger time) | CWE-426 | Low (hardening) | **Fixed** (v1.5.0, VR pass) |
 | I-1 | Transcript logs grow unbounded (no rotation) | CWE-400 | Low | **Fixed** (v1.5.0) |
 | I-2 | On-host controls defeatable by the OS vendor (hardcoded IP / DoH) | — | Info | Documented ceiling |
 
@@ -52,6 +54,52 @@ AFTER:   C:\ProgramData\SuppressGDID   NT AUTHORITY\SYSTEM:(OI)(CI)(F)
 - `-Verify` gains a permanent regression check: `[PASS] install dir not writable by standard users`.
 - Covered by unit tests (`New-HardenedAcl`) and `Tests/Smoke-Test.ps1` (applies the DACL to a real
   temp dir and asserts Users cannot write).
+
+## H-2 — Install-dir ownership was never asserted  *(fixed, v1.5.0 — adversarial VR pass)*
+
+**What.** H-1 hardened the *DACL*. It never touched the *owner*, and the owner is not bound by the
+DACL: in Windows the object owner retains implicit `READ_CONTROL` + `WRITE_DAC` regardless of the
+DACL unless an `OWNER RIGHTS` (`S-1-3-4`) ACE strips it — and none was present.
+
+**Impact (local privilege escalation).**
+1. `C:\ProgramData` grants `Users` *create folders / append data* by default, so a **standard user
+   pre-creates** `C:\ProgramData\SuppressGDID` and becomes `CREATOR OWNER`.
+2. An admin later runs `-Apply`. `Protect-InstallDir` re-wrote the DACL (`Set-Acl`) but the object it
+   passed set no owner, so ownership stayed with the attacker. `Test-PathUserWritable` inspects only
+   the DACL access list and cannot see implicit owner rights, so the post-check passed.
+3. The attacker still owns the directory → at any later time they `Set-Acl` to re-grant themselves
+   `FullControl`, delete `Suppress-GDID.ps1`, and drop a replacement.
+4. `GDIDie-Enforce` runs `%ProgramData%\SuppressGDID\Suppress-GDID.ps1` **as SYSTEM** at next boot or
+   servicing re-apply → attacker code executes as SYSTEM.
+
+The same root cause weakened `state.json` (an attacker-owned file could steer `-Undo`) and the
+predictable transcript path (a pre-planted hardlink at `gdid-<mode>-<stamp>.log` gives an arbitrary
+write in the `-Apply`/SYSTEM context).
+
+**Fix (v1.5.0).**
+- `New-HardenedAcl` now calls `SetOwner(BUILTIN\Administrators)`, so `Set-Acl` **re-takes ownership**
+  at apply time (the elevated process holds `SeTakeOwnership`). An elevated admin creates objects
+  owned by `Administrators` and the SYSTEM task creates them owned by `SYSTEM`, so both legitimate
+  writers are trusted owners; anything else means a standard user owns the object.
+- `Test-PathOwnerUntrusted` rejects any owner outside `{SYSTEM, Administrators}`, and it is wired into
+  **every** fail-closed gate — `Protect-InstallDir`, `Protect-InstalledScript`, `Assert-InstallSafe`,
+  `Read-StateFileSafely`, `Write-StateFileSafely`, `Get-StateForUndo` — and into `-Verify` as two new
+  regression checks (`install dir owned by SYSTEM/Administrators`, `installed script owned by …`).
+- Pinned by `VR-1` in `Tests/Audit-Findings.ps1`: a live check that `Set-Acl (New-HardenedAcl)`
+  re-vests ownership on a real directory (the assertion that would have caught the pre-created dir),
+  plus AST checks that each gate consults the owner and not only the DACL.
+
+**Residual.** None for the install dir. The `%ProgramData%` root itself is owner-trusted by the OS;
+if an environment re-parents `%ProgramData%` to a user-writable location the premise changes, but that
+is outside this tool's control.
+
+## P-1 — Unqualified interpreter in the SYSTEM task  *(fixed, v1.5.0 — VR pass)*
+
+`Install-Persistence` registered the task with `-Execute 'powershell.exe'`, leaving the interpreter to
+PATH resolution when the SYSTEM task triggers. Not directly exploitable — a standard user cannot write
+`System32` or any earlier entry in SYSTEM's PATH — but an unqualified interpreter in a SYSTEM task is a
+hardening gap. Now registered with the absolute
+`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`. Pinned by `VR-2`.
 
 ## T-1 — Check-then-register TOCTOU window  *(mitigated, v1.5.0)*
 

@@ -82,6 +82,9 @@ if (-not $onWindows) {
     $adm = $ar | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-32-544' }
     Assert ($adm.FileSystemRights -eq 'FullControl') 'Administrators = FullControl'
     Assert (($ar | Where-Object { $_.IdentityReference.Value -eq 'S-1-1-0' }).Count -eq 0) 'no Everyone ACE'
+    # VR-1: the hardened ACL must vest ownership in Administrators, or Set-Acl leaves a pre-created
+    # attacker-owned directory owned by the attacker (implicit WRITE_DAC survives the DACL rewrite).
+    Assert ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -eq 'S-1-5-32-544') 'hardened ACL owner is Administrators (re-takes ownership)'
 }
 
 Write-Host "persistence carries every scope choice" -ForegroundColor Cyan

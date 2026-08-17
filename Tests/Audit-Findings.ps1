@@ -305,8 +305,11 @@ $stateDir = Join-Path ([IO.Path]::GetTempPath()) ("gdidie-state-" + [Guid]::NewG
 New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
 try {
     $StateFile = Join-Path $stateDir 'state.json'
-    $script:fakeWritable = $false
-    function Test-PathUserWritable([string]$path) { $script:fakeWritable }
+    # Shadow BOTH ACL probes so the classification logic is testable on both lanes. VR-1 added an
+    # owner check to Get-StateForUndo, so it needs a stub too, or Get-Acl fires on the Linux lane.
+    $script:fakeWritable = $false; $script:fakeOwnerUntrusted = $false
+    function Test-PathUserWritable([string]$path)   { $script:fakeWritable }
+    function Test-PathOwnerUntrusted([string]$path) { $script:fakeOwnerUntrusted }
 
     Assert-Finding 'A-7' ((Get-StateForUndo).Status -eq 'missing')                                   'no file -> missing (not an exception)'
     Set-Content -LiteralPath $StateFile -Value 'this is not json {{{' -Encoding ASCII
@@ -318,6 +321,11 @@ try {
     $bad = Get-StateForUndo
     Assert-Finding 'A-7' ($bad.Status -eq 'untrusted' -and $null -eq $bad.State)                     'a user-writable file -> untrusted AND never parsed'
     $script:fakeWritable = $false
+    # VR-1: an untrusted OWNER (implicit WRITE_DAC) must classify untrusted and never be parsed.
+    $script:fakeOwnerUntrusted = $true
+    $badOwner = Get-StateForUndo
+    Assert-Finding 'VR-1' ($badOwner.Status -eq 'untrusted' -and $null -eq $badOwner.State)          'a state file owned by a standard user -> untrusted AND never parsed'
+    $script:fakeOwnerUntrusted = $false
 } finally { Remove-Item $stateDir -Recurse -Force -ErrorAction SilentlyContinue }
 Assert-Finding 'A-7' ($fnUndo.Extent.Text -match 'state file \$\(\$si\.Status\)')                       'undo surfaces the classification to the user'
 Assert-Finding 'A-7' ($fnUndo.Extent.Text -match 'Re-run with -Force')                                 'undo names the escape hatch'
@@ -401,6 +409,53 @@ $ciText = Get-DocText '.github/workflows/ci.yml'
 Assert-Finding 'A-13' (@([regex]::Matches($ciText,'if: always\(\)')).Count -ge 2)                     'both CI lanes run the meta-test even when the loop step fails'
 if ($onWindows) { Assert-Finding 'A-10' $true 'running the Windows lane: ACL assertions are live' }
 else            { Write-SkippedFinding 'A-10' 'ACL assertion liveness' 'non-Windows lane; CI Windows job covers it' }
+
+Section 'VR-1  install-dir ownership must be asserted, not just the DACL'
+# the trusted-owner set is exactly SYSTEM + Administrators (behavioural, cross-platform)
+Assert-Finding 'VR-1' ((@($script:TrustedOwnerSids | Sort-Object) -join ',') -eq 'S-1-5-18,S-1-5-32-544') 'only SYSTEM and Administrators are trusted owners'
+Assert-Finding 'VR-1' ([bool](Get-Fn 'Test-PathOwnerUntrusted'))                                       'an owner-trust predicate exists'
+$hardenedAcl = Get-Fn 'New-HardenedAcl'
+# AST, not raw text: find the .SetOwner(...) member invocation so a comment mentioning SetOwner
+# cannot satisfy the pin (the A-13 lesson - a pin must not match the prose that explains it).
+$setOwnerCall = @($hardenedAcl.FindAll({ param($n)
+    ($n -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) -and ("$($n.Member)" -eq 'SetOwner') }, $true))
+Assert-Finding 'VR-1' ($setOwnerCall.Count -ge 1)                                                      'the hardened ACL sets an owner (so Set-Acl re-takes the directory)'
+Assert-Finding 'VR-1' ($setOwnerCall.Count -ge 1 -and "$($setOwnerCall[0].Extent.Text)" -match 'S-1-5-32-544') 'ownership is vested in Administrators'
+# every fail-closed gate consults the owner, not just the DACL (structural)
+foreach ($fn in 'Protect-InstallDir','Protect-InstalledScript','Assert-InstallSafe','Read-StateFileSafely','Write-StateFileSafely','Get-StateForUndo','Invoke-Verify') {
+    $f = Get-Fn $fn
+    Assert-Finding 'VR-1' (Test-CommandCall $f 'Test-PathOwnerUntrusted') ("$fn checks the owner, not just the DACL")
+}
+# the DACL-only writability check must NOT be treated as sufficient on its own in the install gate
+$fnProtectDir = Get-Fn 'Protect-InstallDir'
+Assert-Finding 'VR-1' ((Get-CallAst $fnProtectDir 'Test-PathOwnerUntrusted').Count -ge 1 -and (Get-CallAst $fnProtectDir 'Test-PathUserWritable').Count -ge 1) 'Protect-InstallDir gates on owner AND DACL'
+if ($onWindows) {
+    # live proof: applying the hardened ACL to a real dir re-vests ownership in Administrators and
+    # the owner check clears. This is the assertion that would have caught the pre-created-dir LPE.
+    $vrTmp = Join-Path ([IO.Path]::GetTempPath()) ("gdidie-vr1-" + [Guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $vrTmp -Force | Out-Null
+    try {
+        Set-Acl -LiteralPath $vrTmp -AclObject (New-HardenedAcl)
+        $ownerSid = (Get-Acl -LiteralPath $vrTmp).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        Assert-Finding 'VR-1' ($ownerSid -eq 'S-1-5-32-544')            'live: hardened dir is owned by Administrators after Set-Acl'
+        Assert-Finding 'VR-1' (-not (Test-PathOwnerUntrusted $vrTmp))   'live: the owner check clears on a properly hardened dir'
+    } finally { Remove-Item -LiteralPath $vrTmp -Recurse -Force -ErrorAction SilentlyContinue }
+} else {
+    Write-SkippedFinding 'VR-1' 'live owner re-take on a real dir' 'Set-Acl/owner APIs are Windows-only; CI Windows job covers it'
+}
+
+Assert-Finding 'VR-1' ($AuditDoc -match 'H-2' -and $AuditDoc -match 'WRITE_DAC')                       'SECURITY-AUDIT.md documents the ownership finding and why a DACL is insufficient'
+
+Section 'VR-2  the SYSTEM task must not resolve its interpreter via PATH'
+# Inspect the New-ScheduledTaskAction call node, not the whole function text (which includes the
+# comment that names the old bare form) - again the A-13 discipline.
+$fnInstallP = Get-Fn 'Install-Persistence'
+$taskAction = @(Get-CallAst $fnInstallP 'New-ScheduledTaskAction')
+Assert-Finding 'VR-2' ($taskAction.Count -ge 1)                                                        'the persistence task action is created'
+$actionText = if ($taskAction.Count) { "$($taskAction[0].Extent.Text)" } else { '' }
+Assert-Finding 'VR-2' ($actionText -notmatch "-Execute\s+'powershell\.exe'")                          'the action no longer uses the bare powershell.exe name'
+Assert-Finding 'VR-2' ($fnInstallP.Extent.Text -match 'System32\\WindowsPowerShell\\v1\.0\\powershell\.exe') 'the interpreter is the absolute System32 path'
+Assert-Finding 'VR-2' ($AuditDoc -match 'P-1')                                                         'SECURITY-AUDIT.md documents the unqualified-interpreter finding'
 
 Section 'I-2 / I-3 / I-4  accepted residuals must stay documented'
 Assert-Finding 'I-2' ($Readme -match 'Honest limitations')                                            'README keeps the honest-limitations section'

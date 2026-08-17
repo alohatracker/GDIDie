@@ -330,6 +330,14 @@ function New-HardenedAcl {
         $sid = New-Object System.Security.Principal.SecurityIdentifier($r.Sid)
         $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid,$r.R,$inh,$none,$allow)))
     }
+    # VR-1: SET THE OWNER. A DACL alone does not close the writable-dir-to-SYSTEM hole, because the
+    # object OWNER keeps implicit READ_CONTROL + WRITE_DAC no matter what the DACL says (no OWNER
+    # RIGHTS / S-1-3-4 ACE strips it). A standard user can pre-create %ProgramData%\SuppressGDID
+    # (default ProgramData grants Users 'create folders'), becoming CREATOR OWNER; Set-Acl would
+    # then rewrite the DACL but leave them owner, so they could re-open the DACL later and hijack
+    # the file the GDIDie-Enforce SYSTEM task runs. Re-vesting ownership in Administrators (the
+    # elevated process holds SeTakeOwnership) makes Set-Acl re-take the directory at apply time.
+    $acl.SetOwner((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')))
     $acl
 }
 function Test-PathIsReparse([string]$path) {
@@ -352,6 +360,18 @@ function Test-PathUserWritable([string]$path) {
         ($_.FileSystemRights -band $wmask) -and
         (Test-IdentityUntrusted $_.IdentityReference) })
 }
+# VR-1: only SYSTEM and Administrators are trustworthy owners. An elevated admin process creates
+# objects owned by the Administrators group by default, and the SYSTEM task creates them owned by
+# SYSTEM, so both legitimate writers land in this set; anything else means a standard user owns the
+# object and therefore holds implicit WRITE_DAC over it.
+$script:TrustedOwnerSids = @('S-1-5-18','S-1-5-32-544')  # SYSTEM, Administrators
+function Test-PathOwnerUntrusted([string]$path) {
+    # true if the object owner is NOT SYSTEM/Administrators. Owner implies WRITE_DAC, so an untrusted
+    # owner is effectively write access that Test-PathUserWritable (DACL-only) cannot see.
+    $sid = try { (Get-Acl -LiteralPath $path).GetOwner([System.Security.Principal.SecurityIdentifier]).Value }
+           catch { $null }
+    (-not $sid) -or ($sid -notin $script:TrustedOwnerSids)
+}
 function Protect-InstallDir {
     # Fail-closed: reject reparse points, create+lock the dir, abort if it stays user-writable.
     if (Test-Path -LiteralPath $InstallDir) {
@@ -359,8 +379,9 @@ function Protect-InstallDir {
     } else {
         New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     }
-    Set-Acl -LiteralPath $InstallDir -AclObject (New-HardenedAcl)   # no swallow: an ACL failure MUST abort
-    if (Test-PathUserWritable $InstallDir) { throw "SECURITY: $InstallDir still user-writable after hardening - aborting." }
+    Set-Acl -LiteralPath $InstallDir -AclObject (New-HardenedAcl)   # no swallow: an ACL failure MUST abort; also RE-TAKES ownership (VR-1)
+    if (Test-PathUserWritable $InstallDir)   { throw "SECURITY: $InstallDir still user-writable after hardening - aborting." }
+    if (Test-PathOwnerUntrusted $InstallDir) { throw "SECURITY: $InstallDir is owned by a standard user after hardening (implicit WRITE_DAC) - aborting." }
 }
 function Protect-InstalledScript {
     # Close H-1: a pre-planted script file keeps its explicit writable ACE across Copy-Item -Force.
@@ -371,7 +392,8 @@ function Protect-InstalledScript {
         Remove-Item -LiteralPath $InstalledScript -Force
     }
     Copy-Item -LiteralPath $PSCommandPath -Destination $InstalledScript -Force
-    if (Test-PathUserWritable $InstalledScript) { throw "SECURITY: installed script is user-writable - refusing to register SYSTEM task." }
+    if (Test-PathUserWritable $InstalledScript)   { throw "SECURITY: installed script is user-writable - refusing to register SYSTEM task." }
+    if (Test-PathOwnerUntrusted $InstalledScript) { throw "SECURITY: installed script is owned by a standard user (implicit WRITE_DAC) - refusing to register SYSTEM task." }
 }
 function Remove-OldAuditLog {
     # L-A: keep the newest $LogKeep transcripts. A boot task that re-applies on every servicing
@@ -492,14 +514,16 @@ function Stop-ServiceReporting([string]$name) {
 function Read-StateFileSafely {
     # F2: never trust a reparse-point or user-writable state file (attacker could steer -Undo).
     if (-not (Test-Path -LiteralPath $StateFile)) { return $null }
-    if (Test-PathIsReparse $StateFile)    { throw "SECURITY: $StateFile is a reparse point - aborting." }
-    if (Test-PathUserWritable $StateFile) { throw "SECURITY: $StateFile is writable by standard users - refusing to trust it." }
+    if (Test-PathIsReparse $StateFile)      { throw "SECURITY: $StateFile is a reparse point - aborting." }
+    if (Test-PathUserWritable $StateFile)   { throw "SECURITY: $StateFile is writable by standard users - refusing to trust it." }
+    if (Test-PathOwnerUntrusted $StateFile) { throw "SECURITY: $StateFile is owned by a standard user (implicit WRITE_DAC) - refusing to trust it." }
     try { Get-Content -LiteralPath $StateFile -Raw | ConvertFrom-Json } catch { $null }
 }
 function Write-StateFileSafely($obj) {
     if ((Test-Path -LiteralPath $StateFile) -and (Test-PathIsReparse $StateFile)) { throw "SECURITY: $StateFile is a reparse point - aborting." }
     ($obj | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $StateFile -Encoding ASCII
-    if (Test-PathUserWritable $StateFile) { throw "SECURITY: $StateFile is user-writable after write - aborting." }
+    if (Test-PathUserWritable $StateFile)   { throw "SECURITY: $StateFile is user-writable after write - aborting." }
+    if (Test-PathOwnerUntrusted $StateFile) { throw "SECURITY: $StateFile is owned by a standard user after write (implicit WRITE_DAC) - aborting." }
 }
 function Get-StateForUndo {
     # A-7: classify the state file instead of throwing a raw SECURITY exception out of -Undo.
@@ -509,8 +533,9 @@ function Get-StateForUndo {
         return @{ State=$null; Status='missing'; Detail="$StateFile does not exist" }
     }
     try {
-        if (Test-PathIsReparse $StateFile)    { return @{ State=$null; Status='untrusted'; Detail="$StateFile is a reparse point" } }
-        if (Test-PathUserWritable $StateFile) { return @{ State=$null; Status='untrusted'; Detail="$StateFile is writable by standard users" } }
+        if (Test-PathIsReparse $StateFile)      { return @{ State=$null; Status='untrusted'; Detail="$StateFile is a reparse point" } }
+        if (Test-PathUserWritable $StateFile)   { return @{ State=$null; Status='untrusted'; Detail="$StateFile is writable by standard users" } }
+        if (Test-PathOwnerUntrusted $StateFile) { return @{ State=$null; Status='untrusted'; Detail="$StateFile is owned by a standard user (implicit WRITE_DAC)" } }
     } catch {
         return @{ State=$null; Status='unreadable'; Detail=$_.Exception.Message }
     }
@@ -583,8 +608,9 @@ function Assert-InstallSafe {
     # or writable by standard users. Checked immediately before Register-ScheduledTask.
     foreach ($p in @($InstallDir, $InstalledScript, $StateFile, $LogDir)) {
         if (-not (Test-Path -LiteralPath $p)) { continue }
-        if (Test-PathIsReparse $p)    { throw "SECURITY: $p is a reparse point - refusing to register SYSTEM task." }
-        if (Test-PathUserWritable $p) { throw "SECURITY: $p is user-writable - refusing to register SYSTEM task." }
+        if (Test-PathIsReparse $p)      { throw "SECURITY: $p is a reparse point - refusing to register SYSTEM task." }
+        if (Test-PathUserWritable $p)   { throw "SECURITY: $p is user-writable - refusing to register SYSTEM task." }
+        if (Test-PathOwnerUntrusted $p) { throw "SECURITY: $p is owned by a standard user (implicit WRITE_DAC) - refusing to register SYSTEM task." }
     }
 }
 function Install-Persistence {
@@ -592,7 +618,10 @@ function Install-Persistence {
     Protect-InstalledScript          # H-1/H-2: reparse-safe, fail-closed; aborts if file stays user-writable
     Assert-InstallSafe               # F6: gate on dir + script + state.json + logs before registering
     $want    = Get-PersistenceArgument $IncludeLoginLive $IncludeClassicTelemetry
-    $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $want
+    # VR-2: absolute path, not the bare name. A SYSTEM task with -Execute 'powershell.exe' leans on
+    # PATH resolution at trigger time; the qualified System32 path removes that search entirely.
+    $ps      = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $action  = New-ScheduledTaskAction -Execute $ps -Argument $want
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $princ   = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest -LogonType ServiceAccount
     $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
@@ -801,6 +830,10 @@ function Invoke-Verify {
 
     if (Test-Path $InstallDir)      { Check (-not (Test-PathUserWritable $InstallDir)) "install dir not writable by standard users" }
     if (Test-Path $InstalledScript) { Check (-not (Test-PathUserWritable $InstalledScript)) "installed script not writable by standard users" }
+    # VR-1 regression: a trusted DACL with an untrusted owner is still hijackable (owner has implicit
+    # WRITE_DAC), so verify ownership too - this is the check that would catch a pre-created dir.
+    if (Test-Path $InstallDir)      { Check (-not (Test-PathOwnerUntrusted $InstallDir)) "install dir owned by SYSTEM/Administrators (not a standard user)" }
+    if (Test-Path $InstalledScript) { Check (-not (Test-PathOwnerUntrusted $InstalledScript)) "installed script owned by SYSTEM/Administrators" }
     # The task runs as SYSTEM and is not readable by a standard user, so only check it when elevated.
     if (Test-IsElevated) {
         $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue

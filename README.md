@@ -101,7 +101,7 @@ a previous, broader `-Apply` disabled. Use `-Undo` for that.
 
 ### Durability, logging, exit codes
 
-- **Persistence:** `-Apply` installs a copy to `%ProgramData%\SuppressGDID\` (locked to an explicit SYSTEM/Admin-full, Users-read-only DACL — see [SECURITY-AUDIT.md](SECURITY-AUDIT.md) H-1) and registers a SYSTEM scheduled task **`GDIDie-Enforce`** that re-applies at startup — so a Windows feature update that re-enables `CDPSvc` gets re-blocked. The task carries every scope switch you chose, and `-Verify` fails if the registered arguments drift from the recorded scope. `-Undo` removes it.
+- **Persistence:** `-Apply` installs a copy to `%ProgramData%\SuppressGDID\` (locked to an explicit SYSTEM/Admin-full, Users-read-only DACL **and re-owned to Administrators** so a pre-created attacker-owned directory can't keep implicit `WRITE_DAC` — see [SECURITY-AUDIT.md](SECURITY-AUDIT.md) H-1/H-2) and registers a SYSTEM scheduled task **`GDIDie-Enforce`** (absolute interpreter path, no PATH search) that re-applies at startup — so a Windows feature update that re-enables `CDPSvc` gets re-blocked. The task carries every scope switch you chose, and `-Verify` fails if the registered arguments drift from the recorded scope. `-Undo` removes it.
 - **Audit log:** every `-Apply`/`-Undo`/`-Test` writes a timestamped transcript to `%ProgramData%\SuppressGDID\logs\`, capped at the newest 30 files.
 - **Automation:** gate CI/Intune/SCCM on the exit code. Only deterministic configuration state affects it — network reachability is advisory, so a proxy or an offline machine cannot flap your gate.
 
