@@ -136,9 +136,11 @@ $p2 = Get-ServiceRestorePlan $rawState @('DoSvc') $false
 Assert-Finding 'H-C' ($p2['DoSvc'].Action -eq 'skip')                                               'state present but no original for this service -> left alone, never guessed'
 $p3 = Get-ServiceRestorePlan $null @('CDPSvc','DoSvc') $false
 Assert-Finding 'H-C' (@($p3.Values | Where-Object { $_.Action -eq 'refuse' }).Count -eq 2)          'no state and no -Force -> refuse (both services)'
-$p4 = Get-ServiceRestorePlan $null @('CDPSvc','DiagTrack') $true
+$p4 = Get-ServiceRestorePlan $null @('CDPSvc','DoSvc','DiagTrack') $true
 Assert-Finding 'H-C' ($p4['CDPSvc'].Action -eq 'default' -and $p4['CDPSvc'].Mode -eq 'Automatic')   'no state WITH -Force -> documented default, flagged as such'
-Assert-Finding 'H-C' ($p4['DiagTrack'].Mode -eq $ServiceDefaults['DiagTrack'])                      'defaults come from the published table, not an inline literal'
+# V-7 re-pointed this at a CORE service: DiagTrack now correctly returns 'skip' under -Force
+# (never re-enable telemetry from a guess), so it can no longer demonstrate the table lookup.
+Assert-Finding 'H-C' ($p4['DoSvc'].Mode -eq $ServiceDefaults['DoSvc'])                              'defaults come from the published table, not an inline literal'
 $p5 = Get-ServiceRestorePlan @{ services = @{ DoSvc = 'Manual' } } @('DoSvc') $false
 Assert-Finding 'H-C' ($p5['DoSvc'].Action -eq 'set-mode' -and $p5['DoSvc'].Mode -eq 'Manual')       'legacy friendly-only state still restores'
 $p6 = Get-ServiceRestorePlan @{ cdpUserStart = 2 } @('CDPUserSvc') $false
@@ -496,6 +498,21 @@ try {
     Assert-Finding 'V-6' ($with2 -notmatch 'HOSTLINE')                                                 'confirmed: 2>&1 does NOT capture Write-Host from an in-process call'
     Assert-Finding 'V-6' ($withAll -match 'HOSTLINE')                                                  'confirmed: *>&1 does capture it'
 } finally { Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue }
+
+Section 'V-7  -Undo -Force must never re-enable telemetry from a guess'
+$forced = Get-ServiceRestorePlan $null (@($AllKillServices) + @($UserKillServices)) $true
+foreach ($core in 'CDPSvc','DoSvc','CDPUserSvc') {
+    Assert-Finding 'V-7' ($forced[$core].Action -eq 'default') ("-Force still restores a documented default for $core")
+}
+foreach ($classic in 'DiagTrack','dmwappushservice') {
+    Assert-Finding 'V-7' ($forced[$classic].Action -eq 'skip') ("-Force leaves $classic alone instead of guessing it back on")
+    Assert-Finding 'V-7' ($forced[$classic].Reason -match 'telemetry')                                ("the reason for $classic names the risk")
+}
+# a RECORDED original still wins - this must not have broken exact restore for an opt-in apply
+$recorded = Get-ServiceRestorePlan @{ servicesRaw = @{ DiagTrack = @{ Start = 2 } } } @('DiagTrack') $true
+Assert-Finding 'V-7' ($recorded['DiagTrack'].Action -eq 'set-raw' -and $recorded['DiagTrack'].Start -eq 2) 'a recorded original still restores DiagTrack exactly'
+Assert-Finding 'V-7' ($fnUndo.Extent.Text -match 'LEFT ALONE')                                        'the refusal message tells the operator what -Force will not touch'
+Assert-Finding 'V-7' ($Readme -match 'never re-enables|left alone')                                   'README documents the -Force scope limit'
 
 Section 'V-5  a workflow that YAML rejects must not be able to masquerade as a pass'
 $wfFiles = @(Get-ChildItem -LiteralPath (Join-Path $Repo '.github/workflows') -Filter '*.yml' -File -ErrorAction SilentlyContinue)

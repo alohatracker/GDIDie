@@ -257,6 +257,15 @@
             Rationale   = 'The tool reports through Write-Host, which in Windows PowerShell 5.1 writes to the INFORMATION stream; an in-process call captured with 2>&1 yields an empty string. So the -Apply check for a SECURITY: throw could never fail, and the post-apply -Verify check threw even though the log plainly showed ALL CONFIGURATION CHECKS PASS. A false PASS inside the validation lane - the H-A class, one level up.'
         }
 
+        @{  Id          = 'V-7'
+            Severity    = 'High'
+            Title       = '-Undo -Force re-enabled classic telemetry that a default -Apply never touched, from a guess'
+            Disposition = 'Fixed'
+            Platform    = 'Any'
+            Fix         = 'Get-ServiceRestorePlan no longer emits a default action for the classic telemetry services when there is no recorded original: they are skipped with an explicit reason, and the refusal message lists them as LEFT ALONE. -Force still restores documented defaults for the core services a default apply does disable.'
+            Rationale   = 'Found by the integration run, not by reading. The runner image shipped DiagTrack disabled; a default -Apply correctly left it alone (M-C); then -Undo -Force set it to Automatic because it appeared in the ServiceDefaults table. For a privacy tool that means silently switching telemetry back ON for a user who had deliberately disabled it. With no state file the honest answer is not to guess, and the safe direction is the more restrictive state.'
+        }
+
         # --- VR pass (adversarial LPE audit) ----------------------------------------------------
         @{  Id          = 'VR-1'
             Severity    = 'High'

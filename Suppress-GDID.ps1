@@ -257,6 +257,15 @@ function Get-ServiceRestorePlan($state,[string[]]$services,[bool]$allowDefaults)
         elseif ($state) {
             $plan[$s] = @{ Action='skip'; Reason='no original recorded (already disabled before -Apply, or never modified)' }
         }
+        elseif ($allowDefaults -and ($ClassicKillServices -contains $s)) {
+            # V-7: -Force must never re-enable classic telemetry from a guess. A default -Apply does
+            # not touch DiagTrack/dmwappushservice at all, so with no state file we cannot know
+            # whether the operator had disabled them themselves - and guessing 'Automatic' switches
+            # telemetry back ON for the user of a privacy tool. Found by running -Undo -Force on a
+            # machine that shipped DiagTrack disabled: it came back Automatic. Fail toward the more
+            # restrictive state and say so.
+            $plan[$s] = @{ Action='skip'; Reason='out of the default scope with no recorded original - left alone rather than risk re-enabling telemetry' }
+        }
         elseif ($allowDefaults -and $ServiceDefaults.ContainsKey($s)) {
             $plan[$s] = @{ Action='default'; Mode=$ServiceDefaults[$s] }
         }
@@ -773,7 +782,10 @@ function Invoke-Undo {
                 Write-Host "  Nothing was changed. Your options:" -ForegroundColor Yellow
                 Write-Host "    1. Restore $StateFile from a backup and re-run -Undo (exact restore)."
                 Write-Host "    2. Re-run with -Force to apply documented Microsoft defaults instead:"
-                foreach ($k in ($ServiceDefaults.Keys | Sort-Object)) { Write-Host ("         {0,-18} -> {1}" -f $k,$ServiceDefaults[$k]) }
+                foreach ($k in ($ServiceDefaults.Keys | Sort-Object | Where-Object { $ClassicKillServices -notcontains $_ })) {
+                    Write-Host ("         {0,-18} -> {1}" -f $k,$ServiceDefaults[$k])
+                }
+                Write-Host ("         {0} -> LEFT ALONE (-Force never re-enables telemetry from a guess)" -f ($ClassicKillServices -join ', '))
                 Write-Host ("         {0} -> removed (default-Windows absent)" -f ($PolicyNames -join ', '))
                 Write-Host "       These are defaults, NOT your original configuration."
                 Write-Host "    3. Undo by hand: services.msc, remove the hosts block between the GDID-SUPPRESS"
